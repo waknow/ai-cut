@@ -15,6 +15,7 @@ audio/
 analysis/
 edit/
 export/
+project.json
 
 # 测试与缓存
 .pytest_cache/

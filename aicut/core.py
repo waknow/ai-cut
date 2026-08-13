@@ -23,9 +23,13 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"  # project.json 契约版本（1.0 单素材 → 1.1 多素材）
 HEAD_HASH_BYTES = 1 << 20  # 读取原片头部 1 MiB 计算哈希
 PROJECT_SUBDIRS = ("media", "proxy", "audio", "analysis", "edit", "export")
+
+# 自动扫描时识别的视频扩展名
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".ts", ".webm",
+                    ".mpg", ".mpeg", ".mts", ".m2ts", ".3gp"}
 
 # 内置默认配置，与仓库根 config.example.json 保持同步
 DEFAULT_CONFIG = {
@@ -174,19 +178,37 @@ def probe(source: str) -> dict:
 
 
 def init_project(project_dir: str) -> dict:
-    """初始化项目目录结构与 project.json（可重复执行，幂等）。"""
+    """初始化项目目录结构与 project.json（可重复执行，幂等）。
+
+    旧版 1.0 project.json（单素材 source_path）自动迁移为 1.1 多素材模型。
+    """
     project_dir = os.path.abspath(project_dir)
     for sub in PROJECT_SUBDIRS:
         os.makedirs(os.path.join(project_dir, sub), exist_ok=True)
     proj_file = os.path.join(project_dir, "project.json")
-    if not os.path.isfile(proj_file):
-        _write_json(proj_file, {
+    proj = _read_json(proj_file)
+    if proj is None:
+        proj = {
             "schema_version": SCHEMA_VERSION,
             "source_immutable": True,
-            "source_path": None,
-            "source_head_sha256": None,
+            "sources": [],
             "created_at": _now_iso(),
-        })
+        }
+    elif proj.get("schema_version") != SCHEMA_VERSION and "sources" not in proj:
+        # 1.0 → 1.1 迁移：单素材字段收敛为 sources 数组
+        old_path = proj.pop("source_path", None)
+        old_hash = proj.pop("source_head_sha256", None) or ""
+        old_at = proj.pop("ingested_at", None)
+        proj["sources"] = []
+        if old_path:
+            proj["sources"].append({
+                "id": "s0001",
+                "path": old_path,
+                "head_sha256": old_hash,
+                "registered_at": old_at or proj.get("created_at"),
+            })
+        proj["schema_version"] = SCHEMA_VERSION
+    _write_json(proj_file, proj)
     return {
         "project_dir": project_dir,
         "directories": list(PROJECT_SUBDIRS),
@@ -207,10 +229,11 @@ def _extract_audio(source: str, wav: str, sample_rate: int) -> bool:
         return False
 
 
-def make_proxy(source: str, project_dir: str, config: dict) -> dict:
-    """生成 proxy-720p.mp4、proxy-360p.mp4 与 speech-16k.wav。
+def make_proxy(source: str, project_dir: str, source_id: str, config: dict) -> dict:
+    """生成 {source_id}-720p.mp4、{source_id}-360p.mp4 与 {source_id}-16k.wav。
 
-    返回相对项目目录的路径字典。无音轨素材生成静音 WAV（时长等于源时长）。
+    产物按素材 ID 命名，多素材互不覆盖。返回相对项目目录的路径字典。
+    无音轨素材生成静音 WAV（时长等于源时长）。
     """
     source = os.path.abspath(source)
     project_dir = os.path.abspath(project_dir)
@@ -224,21 +247,21 @@ def make_proxy(source: str, project_dir: str, config: dict) -> dict:
     os.makedirs(proxy_dir, exist_ok=True)
     os.makedirs(audio_dir, exist_ok=True)
 
-    p360 = os.path.join(proxy_dir, "proxy-360p.mp4")
-    p720 = os.path.join(proxy_dir, "proxy-720p.mp4")
-    wav = os.path.join(audio_dir, "speech-16k.wav")
+    p360 = os.path.join(proxy_dir, f"{source_id}-360p.mp4")
+    p720 = os.path.join(proxy_dir, f"{source_id}-720p.mp4")
+    wav = os.path.join(audio_dir, f"{source_id}-16k.wav")
 
     _run(
         ["ffmpeg", "-y", "-i", source, "-map", "0:v:0",
          "-vf", f"scale=-2:{coarse}", "-an", "-c:v", "libx264",
          "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", p360],
-        "生成 360p Proxy",
+        f"生成 {source_id} 360p Proxy",
     )
     _run(
         ["ffmpeg", "-y", "-i", source, "-map", "0:v:0",
          "-vf", f"scale=-2:{review}", "-an", "-c:v", "libx264",
          "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", p720],
-        "生成 720p Proxy",
+        f"生成 {source_id} 720p Proxy",
     )
     if not _extract_audio(source, wav, sample_rate):
         duration = probe(source)["source"]["duration"]
@@ -255,38 +278,102 @@ def make_proxy(source: str, project_dir: str, config: dict) -> dict:
     }
 
 
-def ingest(project_dir: str, source: str, config: dict | None = None) -> dict:
-    """组合入口：init → probe → 登记 → make_proxy。
+def scan_sources(project_dir: str) -> list[str]:
+    """自动扫描项目 media/ 目录下的视频素材（递归，按路径排序）。"""
+    media_dir = os.path.join(os.path.abspath(project_dir), "media")
+    if not os.path.isdir(media_dir):
+        return []
+    found = []
+    for root, _dirs, files in os.walk(media_dir):
+        for name in sorted(files):
+            if os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
+                found.append(os.path.join(root, name))
+    return sorted(found)
 
-    可重复执行；检测到源素材被替换（头部哈希变化）时报错，保护既有分析产物。
+
+def _register_source(project_dir: str, proj: dict, path: str, config: dict) -> dict:
+    """注册单个素材：probe → 登记 project.json → 写 media/sources/ → 生成 Proxy。
+
+    同路径同哈希=幂等跳过（产物缺失时重建）；同路径异哈希=报错（素材被替换）；
+    新路径=追加注册。
+    """
+    path = os.path.abspath(path)
+    meta = probe(path)
+    src = meta["source"]
+    sources = proj.setdefault("sources", [])
+
+    existing = next((s for s in sources if s["path"] == path), None)
+    if existing:
+        if existing["head_sha256"] != src["head_sha256"]:
+            raise RuntimeError(
+                f"素材已被替换（头部哈希变化）：{path}\n"
+                "原片只读：请勿覆盖已登记素材；新素材请使用不同路径。"
+            )
+        source_id = existing["id"]
+        status = "unchanged"
+        # 元数据与产物缺失时补齐，保证可重复执行语义
+        meta_file = os.path.join(project_dir, "media", "sources", f"{source_id}.json")
+        if not os.path.isfile(meta_file):
+            _write_json(meta_file, meta)
+        expected = [
+            os.path.join(project_dir, "proxy", f"{source_id}-360p.mp4"),
+            os.path.join(project_dir, "proxy", f"{source_id}-720p.mp4"),
+            os.path.join(project_dir, "audio", f"{source_id}-16k.wav"),
+        ]
+        proxies = None
+        if not all(os.path.isfile(p) for p in expected):
+            proxies = make_proxy(path, project_dir, source_id, config)
+    else:
+        source_id = f"s{len(sources) + 1:04d}"
+        sources.append({
+            "id": source_id,
+            "path": path,
+            "head_sha256": src["head_sha256"],
+            "registered_at": _now_iso(),
+        })
+        status = "added"
+        _write_json(os.path.join(project_dir, "media", "sources", f"{source_id}.json"), meta)
+        proxies = make_proxy(path, project_dir, source_id, config)
+
+    return {
+        "id": source_id,
+        "path": path,
+        "status": status,
+        "source": src,
+        "proxies": proxies,
+    }
+
+
+def ingest(project_dir: str, source: str | None = None, config: dict | None = None) -> dict:
+    """组合入口：init → 注册素材 → 生成 Proxy。支持增量和自动扫描。
+
+    - source 省略：自动扫描项目 media/ 目录下的视频素材。
+    - source 指定：显式注册该素材（新素材追加，已登记素材幂等，替换报错）。
     """
     config = config or load_config()
     init_project(project_dir)
-    meta = probe(source)
-    src = meta["source"]
-
     proj_file = os.path.join(project_dir, "project.json")
     proj = _read_json(proj_file, {}) or {}
-    existing_hash = proj.get("source_head_sha256")
-    if existing_hash and existing_hash != src["head_sha256"]:
-        raise RuntimeError(
-            "检测到源素材被替换（头部哈希变化）。原片只读："
-            "请新建项目目录，或清理旧 project.json / proxy / analysis 后重新 ingest。"
-        )
-    proj.update({
-        "source_path": src["path"],
-        "source_head_sha256": src["head_sha256"],
-        "ingested_at": _now_iso(),
-    })
-    _write_json(proj_file, proj)
-    _write_json(os.path.join(project_dir, "media", "source.json"), meta)
 
-    proxies = make_proxy(source, project_dir, config)
+    if source is None:
+        paths = scan_sources(project_dir)
+        if not paths:
+            raise RuntimeError(
+                "未在项目 media/ 目录找到视频素材。\n"
+                "请将素材放入 <项目>/media/ 后重试，或显式指定：ingest <项目> <素材路径>"
+            )
+    else:
+        paths = [source]
+
+    results = []
+    for path in paths:
+        results.append(_register_source(project_dir, proj, path, config))
+
+    _write_json(proj_file, proj)
     return {
-        "project_dir": project_dir,
+        "project_dir": os.path.abspath(project_dir),
         "project_file": proj_file,
-        "source": src,
-        "proxies": proxies,
+        "sources": results,
     }
 
 

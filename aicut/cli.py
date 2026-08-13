@@ -29,21 +29,22 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    """探测、Proxy、音频（Shot、Contact Sheet 下一步实现）。"""
+    """素材接入：支持增量与自动扫描（SOURCE 省略时扫描项目 media/ 目录）。"""
     project = os.path.abspath(args.project)
-    source = os.path.abspath(args.source)
+    source = os.path.abspath(args.source) if args.source else None
     result = core.ingest(project, source, core.load_config())
-    src = result["source"]
-    print(f"已接入素材：{src['path']}")
-    print(f"  时长 {src['duration']:.1f}s · {src['width']}x{src['height']} · "
-          f"{src['fps']:.2f}fps · {src['video_codec']} / {src['audio_codec'] or '无音轨'}")
-    print(f"  头部哈希 {src['head_sha256'][:12]}…")
-    for label, rel in (
-        ("360p Proxy", result["proxies"]["proxy_360p"]),
-        ("720p Proxy", result["proxies"]["proxy_720p"]),
-        ("16kHz 音频", result["proxies"]["speech_16k_wav"]),
-    ):
-        print(f"  {label}: {os.path.join(project, rel)}")
+    auto = "（自动扫描 media/）" if source is None else ""
+    print(f"素材接入完成：{result['project_dir']}{auto}")
+    for i, item in enumerate(result["sources"], 1):
+        src = item["source"]
+        mark = {"added": "新增", "unchanged": "已存在，跳过"}[item["status"]]
+        print(f"  [{i}] {item['id']} · {os.path.basename(item['path'])} · {mark}")
+        print(f"      时长 {src['duration']:.1f}s · {src['width']}x{src['height']} · "
+              f"{src['fps']:.2f}fps · {src['video_codec']} / {src['audio_codec'] or '无音轨'}")
+        if item["proxies"]:
+            print(f"      360p: {os.path.join(project, item['proxies']['proxy_360p'])}")
+            print(f"      720p: {os.path.join(project, item['proxies']['proxy_720p'])}")
+            print(f"      音频: {os.path.join(project, item['proxies']['speech_16k_wav'])}")
     return 0
 
 
@@ -89,9 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("project", help="项目目录路径")
     p_init.set_defaults(func=cmd_init)
 
-    p_ingest = sub.add_parser("ingest", help="探测、Proxy、音频、Shot、Contact Sheet、初始索引")
+    p_ingest = sub.add_parser("ingest", help="素材接入：探测、Proxy、音频（SOURCE 省略时自动扫描项目 media/）")
     p_ingest.add_argument("project", help="项目目录路径")
-    p_ingest.add_argument("source", help="原始视频绝对路径")
+    p_ingest.add_argument("source", nargs="?", default=None,
+                          help="原始视频路径（可选；省略时自动扫描项目 media/ 目录）")
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_index = sub.add_parser("index", help="合并 transcript 与 Shot，重建 JSON/SQLite")
