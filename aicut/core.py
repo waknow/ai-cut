@@ -489,6 +489,23 @@ def _ollama_available(config: dict) -> bool:
         return False
 
 
+def _extract_json(text: str):
+    """从模型输出中提取 JSON：先整体解析，失败则取首个 {...} 块。"""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
 def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
     """本地 Qwen3-VL（ollama）读取 Contact Sheet，输出结构化画面理解。"""
     import base64
@@ -505,7 +522,6 @@ def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
         "prompt": VISION_PROMPT,
         "images": [b64],
         "stream": False,
-        "format": "json",
     }
     try:
         resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
@@ -513,9 +529,8 @@ def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
         text = resp.json().get("response", "")
     except requests.RequestException as exc:
         raise RuntimeError(f"ollama 调用失败：{exc}")
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+    data = _extract_json(text)
+    if data is None:
         raise RuntimeError(f"ollama 输出不是合法 JSON：{text[:200]}")
     data.setdefault("summary", "")
     data.setdefault("people", [])
