@@ -4,7 +4,7 @@
 
 | 契约 | 路径 | 说明 |
 | --- | --- | --- |
-| 项目文件 | `project/project.json` | `source_immutable=true`，记录原片路径 |
+| 项目文件 | `project.json` | `source_immutable=true`，记录原片路径与头部哈希 |
 | Source 元数据 | `media/source.json` | ffprobe 元数据 + 头部哈希 |
 | Shot 列表 | `analysis/shots.json` | `id/start/end/duration`，稳定编号 `shot-00001` |
 | Transcript | `analysis/transcript.json` | segment/word 级源时间戳 |
