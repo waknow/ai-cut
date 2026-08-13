@@ -1,0 +1,24 @@
+{
+  "proxy": {
+    "coarse_height": 360,
+    "review_height": 720,
+    "scene_threshold": 0.32,
+    "max_shot_seconds": 20
+  },
+  "speech": {
+    "sample_rate": 16000,
+    "engine": "whisper.cpp",
+    "word_timestamps": true
+  },
+  "vision": {
+    "engine": "ollama",
+    "model": "qwen3-vl",
+    "coarse_mode": "contact_sheet",
+    "dense_candidate_fps": 3
+  },
+  "validation": {
+    "minimum_quality": 0.35,
+    "target_duration_tolerance_ratio": 0.08,
+    "target_duration_tolerance_seconds": 2
+  }
+}
