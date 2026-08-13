@@ -19,6 +19,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -370,6 +371,8 @@ def ingest(project_dir: str, source: str | None = None, config: dict | None = No
         results.append(_register_source(project_dir, proj, path, config))
 
     _write_json(proj_file, proj)
+    # 分析阶段：Shot 切分 + Contact Sheet + 初始 Media Index（增量）
+    _analyze(project_dir, config)
     return {
         "project_dir": os.path.abspath(project_dir),
         "project_file": proj_file,
@@ -381,26 +384,8 @@ def ingest(project_dir: str, source: str | None = None, config: dict | None = No
 # 尚未实现的组件（下一步填充）
 # ---------------------------------------------------------------------------
 
-def detect_shots(proxy_360p: str | None = None, config: dict | None = None) -> list[dict]:
-    """FFmpeg scene 检测转场，输出稳定 Shot 契约（id/start/end/duration）。"""
-    raise NotImplementedError
-
-
-def make_contact_sheet(source: str | None = None, shot: dict | None = None,
-                       output_dir: str | None = None) -> str:
-    """每 Shot 一张动态抽帧概览图（帧数按时长 1–9 变化）。"""
-    raise NotImplementedError
-
-
 def import_transcript(wav: str | None = None, config: dict | None = None) -> dict:
     """Whisper/whisper.cpp 转录，标准化 segment/word 时间戳。"""
-    raise NotImplementedError
-
-
-def build_index(project_dir: str | None = None, source_meta: dict | None = None,
-                shots: list[dict] | None = None, transcript: dict | None = None,
-                visual: list[dict] | None = None) -> dict:
-    """合并为统一 Media Index（JSON 权威 + SQLite 缓存）。"""
     raise NotImplementedError
 
 
@@ -420,3 +405,214 @@ def export(timeline: dict | None = None, media_index: dict | None = None,
            project_dir: str | None = None) -> dict:
     """生成 capcut-adapter.json 与 review.html。"""
     raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# 阶段二/三/五：Shot 切分、Contact Sheet、Media Index（架构 §4.2/4.3/4.5）
+# ---------------------------------------------------------------------------
+
+MIN_SHOT_SECONDS = 0.15   # Shot 最短保留时长
+EDGE_PADDING = 0.25       # 忽略距视频首尾小于该值的伪切点
+CONTACT_FRAME_WIDTH = 320  # Contact Sheet 帧宽
+CONTACT_COLS = 3          # 最多三列拼接
+
+
+def _clean_cuts(cuts: list[float], duration: float,
+                min_shot: float = MIN_SHOT_SECONDS,
+                edge: float = EDGE_PADDING,
+                max_shot: float = 20.0) -> list[tuple[float, float]]:
+    """从场景切点列表生成合法 Shot 段 [start, end)。
+
+    规则：忽略首尾 edge 秒内的伪切点；相邻切点间隔 < min_shot 时合并；
+    超长段按 max_shot 强制分段；不足 min_shot 的残余段丢弃。
+    """
+    cuts = sorted({round(t, 3) for t in cuts if edge <= t <= duration - edge})
+    merged: list[float] = []
+    for t in cuts:
+        if not merged or t - merged[-1] >= min_shot:
+            merged.append(t)
+    bounds = [0.0] + merged + [duration]
+    segments: list[tuple[float, float]] = []
+    for i in range(len(bounds) - 1):
+        start, end = bounds[i], bounds[i + 1]
+        while end - start > max_shot:
+            segments.append((round(start, 3), round(start + max_shot, 3)))
+            start += max_shot
+        segments.append((round(start, 3), round(end, 3)))
+    return [(s, e) for s, e in segments if e - s >= min_shot]
+
+
+def detect_shots(proxy_360p: str | None = None, config: dict | None = None,
+                 source_id: str | None = None, start_id: int = 1,
+                 duration: float | None = None) -> list[dict]:
+    """在 360p Proxy 上用 scene 分数检测转场，输出稳定 Shot 契约。
+
+    每个 Shot：{id: shot-00001, source_id, start, end, duration}（秒，[start, end)）。
+    """
+    config = config or load_config()
+    threshold = config.get("proxy", {}).get("scene_threshold", 0.32)
+    max_shot = config.get("proxy", {}).get("max_shot_seconds", 20)
+    proc = _run(
+        ["ffmpeg", "-i", proxy_360p,
+         "-vf", f"select='gt(scene,{threshold})',showinfo",
+         "-f", "null", "-"],
+        "场景检测",
+    )
+    cuts = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", proc.stderr)]
+    if duration is None:
+        duration = probe(proxy_360p)["source"]["duration"]
+    segments = _clean_cuts(cuts, duration, max_shot=max_shot)
+    return [
+        {
+            "id": f"shot-{start_id + i:05d}",
+            "source_id": source_id,
+            "start": s,
+            "end": e,
+            "duration": round(e - s, 3),
+        }
+        for i, (s, e) in enumerate(segments)
+    ]
+
+
+def _frame_count(duration: float) -> int:
+    """按 Shot 时长决定 Contact Sheet 抽帧数（架构 §4.3 表格）。"""
+    if duration < 1.5:
+        return 1
+    if duration < 4:
+        return 3
+    if duration < 8:
+        return 4
+    if duration < 15:
+        return 6
+    return 9
+
+
+def _sample_times(start: float, end: float, n: int) -> list[float]:
+    """抽样点位于各时间分区中点，避免抽到切镜边缘。"""
+    step = (end - start) / n
+    return [round(start + step * (i + 0.5), 3) for i in range(n)]
+
+
+def make_contact_sheet(source: str | None = None, shot: dict | None = None,
+                       output_dir: str | None = None,
+                       frame_width: int = CONTACT_FRAME_WIDTH,
+                       cols: int = CONTACT_COLS) -> str:
+    """每 Shot 一张动态抽帧概览图，每帧写入源时间戳。
+
+    抽样点位于时间分区中点，帧宽统一 320，最多三列拼接。
+    返回拼接图完整路径。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    os.makedirs(output_dir, exist_ok=True)
+    n = _frame_count(shot["duration"])
+    times = _sample_times(shot["start"], shot["end"], n)
+    frames: list[str] = []
+    try:
+        for i, t in enumerate(times):
+            frame = os.path.join(output_dir, f".tmp-{shot['id']}-{i}.jpg")
+            _run(
+                ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", source,
+                 "-frames:v", "1", "-vf", f"scale={frame_width}:-2",
+                 "-q:v", "3", frame],
+                f"抽帧 {shot['id']} @ {t:.2f}s",
+            )
+            frames.append(frame)
+        images = [Image.open(f) for f in frames]
+        height = min(im.height for im in images)
+        images = [
+            im.resize((int(im.width * height / im.height), height)) if im.height != height else im
+            for im in images
+        ]
+        rows = (n + cols - 1) // cols
+        real_cols = min(n, cols)
+        cell_w = max(im.width for im in images)
+        sheet = Image.new("RGB", (real_cols * cell_w, rows * height), "black")
+        draw = ImageDraw.Draw(sheet)
+        font = ImageFont.load_default()
+        for idx, im in enumerate(images):
+            x = (idx % cols) * cell_w
+            y = (idx // cols) * height
+            sheet.paste(im, (x, y))
+            draw.text((x + 4, y + 4), f"{times[idx]:.2f}s", fill="yellow", font=font)
+        out = os.path.join(output_dir, f"{shot['id']}.jpg")
+        sheet.save(out, quality=85)
+        return out
+    finally:
+        for f in frames:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def build_index(project_dir: str | None = None, source_meta: dict | None = None,
+                shots: list[dict] | None = None, transcript: dict | None = None,
+                visual: list[dict] | None = None) -> dict:
+    """合并为统一 Media Index（JSON 权威；SQLite 查询缓存暂未启用）。
+
+    输入缺省时从项目目录读取已有产物（media/sources/*.json + analysis/shots.json）。
+    """
+    project_dir = os.path.abspath(project_dir)
+    sources: list[dict] = []
+    sources_dir = os.path.join(project_dir, "media", "sources")
+    if os.path.isdir(sources_dir):
+        for name in sorted(os.listdir(sources_dir)):
+            if name.endswith(".json"):
+                meta = _read_json(os.path.join(sources_dir, name))
+                if meta:
+                    sources.append(meta["source"])
+    if source_meta:
+        sources = [source_meta] + [s for s in sources if s != source_meta]
+    shot_list = list(shots or [])
+    if not shot_list:
+        data = _read_json(os.path.join(project_dir, "analysis", "shots.json"))
+        if data:
+            shot_list = data.get("shots", [])
+    index = {
+        "schema_version": "1.0",
+        "sources": sources,
+        "shots": shot_list,
+    }
+    if transcript is not None:
+        index["transcript"] = transcript
+    if visual is not None:
+        index["visual"] = visual
+    _write_json(os.path.join(project_dir, "analysis", "media-index.json"), index)
+    return index
+
+
+def _analyze(project_dir: str, config: dict) -> list[dict]:
+    """Shot 切分 + Contact Sheet + 初始索引（增量：只处理未分析素材）。"""
+    proj = _read_json(os.path.join(project_dir, "project.json")) or {}
+    sources = proj.get("sources", [])
+    shots_file = os.path.join(project_dir, "analysis", "shots.json")
+    existing = _read_json(shots_file) or {"schema_version": "1.0", "shots": []}
+    shots = list(existing.get("shots", []))
+    analyzed = {s.get("source_id") for s in shots}
+    next_id = max((int(s["id"].split("-")[1]) for s in shots), default=0) + 1
+
+    new_shots: list[dict] = []
+    for src in sources:
+        if src["id"] in analyzed:
+            continue
+        meta = _read_json(os.path.join(project_dir, "media", "sources", f"{src['id']}.json"))
+        if not meta:
+            continue
+        proxy = os.path.join(project_dir, "proxy", f"{src['id']}-360p.mp4")
+        duration = meta["source"]["duration"]
+        source_shots = detect_shots(proxy, config, source_id=src["id"],
+                                    start_id=next_id, duration=duration)
+        sheet_dir = os.path.join(project_dir, "analysis", "contact-sheets")
+        for shot in source_shots:
+            sheet = make_contact_sheet(meta["source"]["path"], shot, sheet_dir)
+            shot["contact_sheet"] = os.path.relpath(sheet, project_dir)
+        next_id += len(source_shots)
+        new_shots.extend(source_shots)
+
+    if new_shots:
+        shots.extend(new_shots)
+        existing["shots"] = shots
+        _write_json(shots_file, existing)
+        build_index(project_dir)
+    return new_shots

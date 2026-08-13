@@ -28,4 +28,16 @@ audio/s0001-16k.wav          # 16kHz 单声道语音
 `ingest PROJECT [SOURCE]`：SOURCE 省略时自动扫描 `media/` 目录；新素材追加注册，
 已登记素材（路径+头部哈希一致）幂等跳过，同路径哈希变化报错（素材被替换）。
 
+## 分析阶段（ingest 自动执行）产物
+
+```text
+analysis/shots.json                    # Shot 契约：{id: shot-00001, source_id, start, end, duration}
+analysis/contact-sheets/shot-00001.jpg # 每 Shot 一张动态抽帧概览图（帧宽 320，≤3 列，含源时间戳）
+analysis/media-index.json              # Media Index：sources[] + shots[]（JSON 权威）
+```
+
+Shot 规则：scene 阈值 0.32（360p Proxy）；忽略首尾 0.25s 伪切点；最短 0.15s；
+超 20s 强制分段；Contact Sheet 抽帧数 <1.5s→1 / 1.5–4→3 / 4–8→4 / 8–15→6 / ≥15→9。
+分析为增量：已分析素材跳过，新增素材只分析自身。
+
 契约示例与规则详见权威文档 §4.5 / §4.8 / §4.9。修改契约必须同步升级 `schema_version` 并迁移旧数据。

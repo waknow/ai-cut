@@ -5,10 +5,7 @@ from aicut import core
 
 # 尚未实现的组件（骨架占位，下一步填充）
 UNIMPLEMENTED = (
-    "detect_shots",
-    "make_contact_sheet",
     "import_transcript",
-    "build_index",
     "plan",
     "validate",
     "export",
