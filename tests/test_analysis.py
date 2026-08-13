@@ -13,6 +13,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from aicut import core
 
@@ -176,6 +177,15 @@ class IngestAnalysisTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
+        # 隔离外部感知依赖（whisper/ollama），由 test_perception.py 单独覆盖
+        self._perception_patches = [
+            mock.patch.object(core, "_ollama_available", return_value=False),
+            mock.patch.object(core, "_whisper_available", return_value=False),
+        ]
+        for _p in self._perception_patches:
+            _p.start()
+            self.addCleanup(_p.stop)
+
 
     def test_ingest_produces_analysis_artifacts(self):
         project = os.path.join(self.root, "demo")

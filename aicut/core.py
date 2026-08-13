@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,10 +45,14 @@ DEFAULT_CONFIG = {
         "sample_rate": 16000,
         "engine": "whisper.cpp",
         "word_timestamps": True,
+        "bin": "/home/zhumq/tools/whisper.cpp/build/bin/whisper-cli",
+        "model": "/home/zhumq/tools/whisper.cpp/models/ggml-small.bin",
+        "language": "zh",
     },
     "vision": {
         "engine": "ollama",
         "model": "qwen3-vl",
+        "host": "http://127.0.0.1:11434",
         "coarse_mode": "contact_sheet",
         "dense_candidate_fps": 3,
     },
@@ -381,6 +386,178 @@ def ingest(project_dir: str, source: str | None = None, config: dict | None = No
 
 
 # ---------------------------------------------------------------------------
+# 阶段四：语音与视觉理解（架构 §4.4，P2 感知层）
+# ---------------------------------------------------------------------------
+
+VISION_PROMPT = (
+    "你是视频画面分析器。分析这张镜头概览图（Contact Sheet，多帧缩略图，每帧标注源时间戳）。"
+    "只输出 JSON（不要任何其他文字）：\n"
+    '{"summary": "一句话画面摘要（中文）", '
+    '"people": ["画面中的人物描述"], '
+    '"actions": ["正在发生的动作"], '
+    '"location": "地点/场景", '
+    '"quality": {"score": 0.0-1.0, "issues": ["模糊/过暗/抖动等问题"]}, '
+    '"mood": "画面情绪", '
+    '"tags": ["标签，如：风景/人物/运动/夜景"]}'
+)
+
+
+def _find_whisper_cli() -> str | None:
+    """定位 whisper-cli：PATH 优先，其次 ~/tools/whisper.cpp/build/bin。"""
+    import shutil
+    found = shutil.which("whisper-cli")
+    if found:
+        return found
+    candidates = [
+        os.path.expanduser("~/tools/whisper.cpp/build/bin/whisper-cli"),
+        os.path.expanduser("~/whisper.cpp/build/bin/whisper-cli"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _whisper_available(config: dict) -> bool:
+    speech = config.get("speech", {})
+    if speech.get("bin") and os.path.isfile(speech["bin"]):
+        return True
+    return _find_whisper_cli() is not None
+
+
+def import_transcript(wav: str | None = None, config: dict | None = None,
+                      source_id: str | None = None) -> dict:
+    """whisper.cpp 转录：segment 与 word 级源时间戳，输出 transcript 契约。
+
+    返回：{schema_version, sources: {source_id: {segments, words}}}，时间单位秒。
+    """
+    config = config or load_config()
+    speech = config.get("speech", {})
+    bin_path = speech.get("bin") or _find_whisper_cli()
+    model = speech.get("model")
+    language = speech.get("language", "auto")
+    if not bin_path or not model:
+        raise RuntimeError("whisper.cpp 未配置：请在 config 中设置 speech.bin 与 speech.model")
+    if not os.path.isfile(bin_path):
+        raise RuntimeError(f"whisper-cli 不存在：{bin_path}")
+    if not os.path.isfile(model):
+        raise RuntimeError(f"whisper 模型不存在：{model}")
+
+    out_base = os.path.join(tempfile.gettempdir(), f"aicut-whisper-{os.getpid()}-{os.path.basename(wav)}")
+    cmd = [bin_path, "-m", model, "-f", wav, "-ojf", "-of", out_base, "-np"]
+    if language and language != "auto":
+        cmd += ["-l", language]
+    _run(cmd, "whisper.cpp 转录")
+
+    raw = _read_json(out_base + ".json")
+    if not raw:
+        raise RuntimeError(f"whisper 输出解析失败：{out_base}.json")
+    segments: list[dict] = []
+    words: list[dict] = []
+    for seg in raw.get("transcription", []):
+        off = seg.get("offsets", {})
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        segments.append({"start": off.get("from", 0) / 1000.0,
+                         "end": off.get("to", 0) / 1000.0,
+                         "text": text})
+        for tok in seg.get("tokens", []):
+            word = tok.get("text", "").strip()
+            if not word or word.startswith("["):
+                continue
+            toff = tok.get("offsets", {})
+            words.append({"start": toff.get("from", 0) / 1000.0,
+                          "end": toff.get("to", 0) / 1000.0,
+                          "word": word})
+    return {
+        "schema_version": "1.0",
+        "sources": {
+            source_id: {"segments": segments, "words": words},
+        },
+    }
+
+
+def _ollama_available(config: dict) -> bool:
+    import requests
+    vision = config.get("vision", {})
+    host = vision.get("host", "http://127.0.0.1:11434")
+    try:
+        resp = requests.get(f"{host}/api/version", timeout=3)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
+    """本地 Qwen3-VL（ollama）读取 Contact Sheet，输出结构化画面理解。"""
+    import base64
+    import requests
+
+    config = config or load_config()
+    vision = config.get("vision", {})
+    host = vision.get("host", "http://127.0.0.1:11434")
+    model = vision.get("model", "qwen3-vl")
+    with open(contact_sheet, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    payload = {
+        "model": model,
+        "prompt": VISION_PROMPT,
+        "images": [b64],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
+        resp.raise_for_status()
+        text = resp.json().get("response", "")
+    except requests.RequestException as exc:
+        raise RuntimeError(f"ollama 调用失败：{exc}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"ollama 输出不是合法 JSON：{text[:200]}")
+    data.setdefault("summary", "")
+    data.setdefault("people", [])
+    data.setdefault("actions", [])
+    data.setdefault("location", "")
+    data.setdefault("quality", {"score": 0.5, "issues": []})
+    data.setdefault("mood", "")
+    data.setdefault("tags", [])
+    return data
+
+
+def understand(project_dir: str, config: dict | None = None) -> dict:
+    """对全部未分析的 Shot 执行视觉理解，写 analysis/visual.json（增量）。
+
+    visual 契约：{schema_version, shots: {shot_id: 结构化理解}}。
+    """
+    config = config or load_config()
+    project_dir = os.path.abspath(project_dir)
+    shots_data = _read_json(os.path.join(project_dir, "analysis", "shots.json")) or {}
+    shots = shots_data.get("shots", [])
+    visual_file = os.path.join(project_dir, "analysis", "visual.json")
+    existing = _read_json(visual_file) or {"schema_version": "1.0", "shots": {}}
+    by_id = existing.setdefault("shots", {})
+    new_shots: list[dict] = []
+    for shot in shots:
+        if shot["id"] in by_id:
+            continue
+        sheet = os.path.join(project_dir, shot["contact_sheet"])
+        if not os.path.isfile(sheet):
+            continue
+        try:
+            by_id[shot["id"]] = understand_shot(sheet, config)
+            new_shots.append(shot)
+        except RuntimeError as exc:
+            print(f"aicut: 警告：视觉理解 {shot['id']} 失败（跳过）：{exc}")
+    if new_shots:
+        _write_json(visual_file, existing)
+        build_index(project_dir)
+    return existing
+
+
+# ---------------------------------------------------------------------------
 # 阶段六/八：Director（确定性回退）与 Timeline IR（架构 §4.6/4.8）
 # ---------------------------------------------------------------------------
 
@@ -498,11 +675,6 @@ def plan(media_index: dict | None = None, goal: str = "", target_duration: float
 # ---------------------------------------------------------------------------
 # 尚未实现的组件（下一步填充）
 # ---------------------------------------------------------------------------
-
-def import_transcript(wav: str | None = None, config: dict | None = None) -> dict:
-    """Whisper/whisper.cpp 转录，标准化 segment/word 时间戳。"""
-    raise NotImplementedError
-
 
 def validate(timeline: dict | None = None, media_index: dict | None = None,
              config: dict | None = None) -> dict:
@@ -683,12 +855,16 @@ def build_index(project_dir: str | None = None, source_meta: dict | None = None,
         "sources": sources,
         "shots": shot_list,
     }
-    # 合并转录（whisper 就绪后由 import_transcript 生成 analysis/transcript.json）
+    # 合并转录（whisper.cpp 产物 analysis/transcript.json）
     transcript_data = _read_json(os.path.join(project_dir, "analysis", "transcript.json"))
     if transcript_data is not None:
         index["transcript"] = transcript_data
     if transcript is not None:
         index["transcript"] = transcript
+    # 合并视觉理解（qwen3-vl 产物 analysis/visual.json）
+    visual_data = _read_json(os.path.join(project_dir, "analysis", "visual.json"))
+    if visual_data is not None:
+        index["visual"] = visual_data
     if visual is not None:
         index["visual"] = visual
     _write_json(os.path.join(project_dir, "analysis", "media-index.json"), index)
@@ -728,4 +904,39 @@ def _analyze(project_dir: str, config: dict) -> list[dict]:
         existing["shots"] = shots
         _write_json(shots_file, existing)
         build_index(project_dir)
+    # P2 感知层：转录 + 视觉（增量，任一模型不可用时降级继续）
+    _transcribe_missing(project_dir, config)
+    if _ollama_available(config):
+        understand(project_dir, config)
+    else:
+        print("aicut: 警告：ollama 不可用，跳过视觉理解（Contact Sheet 已生成，可稍后重跑 ingest）")
+    build_index(project_dir)
     return new_shots
+
+
+def _transcribe_missing(project_dir: str, config: dict) -> None:
+    """对缺转录的素材执行 whisper 转录（增量），合并进 analysis/transcript.json。"""
+    if not _whisper_available(config):
+        print("aicut: 警告：whisper-cli 不可用，跳过语音转录（可稍后安装后重跑 ingest）")
+        return
+    proj = _read_json(os.path.join(project_dir, "project.json")) or {}
+    sources = proj.get("sources", [])
+    transcript_file = os.path.join(project_dir, "analysis", "transcript.json")
+    existing = _read_json(transcript_file) or {"schema_version": "1.0", "sources": {}}
+    by_source = existing.setdefault("sources", {})
+    changed = False
+    for src in sources:
+        sid = src["id"]
+        if sid in by_source:
+            continue
+        wav = os.path.join(project_dir, "audio", f"{sid}-16k.wav")
+        if not os.path.isfile(wav):
+            continue
+        try:
+            part = import_transcript(wav, config, source_id=sid)
+            by_source[sid] = part["sources"][sid]
+            changed = True
+        except RuntimeError as exc:
+            print(f"aicut: 警告：转录 {sid} 失败：{exc}")
+    if changed:
+        _write_json(transcript_file, existing)

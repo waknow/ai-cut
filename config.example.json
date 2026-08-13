@@ -8,11 +8,15 @@
   "speech": {
     "sample_rate": 16000,
     "engine": "whisper.cpp",
-    "word_timestamps": true
+    "word_timestamps": true,
+    "bin": "/home/zhumq/tools/whisper.cpp/build/bin/whisper-cli",
+    "model": "/home/zhumq/tools/whisper.cpp/models/ggml-small.bin",
+    "language": "zh"
   },
   "vision": {
     "engine": "ollama",
     "model": "qwen3-vl",
+    "host": "http://127.0.0.1:11434",
     "coarse_mode": "contact_sheet",
     "dense_candidate_fps": 3
   },

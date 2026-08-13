@@ -30,7 +30,9 @@ AICut 是面向约 30 分钟 2K 素材的 AI 视频剪辑流水线：`视频素�
 
 ## 工作约定
 
-- **先跑测试再改**：`python -m unittest discover -s tests -v`（PoC 现有测试覆盖 Contact Sheet 抽帧边界、Timeline bounds 校验、合成视频端到端烟雾测试）。
+- **先跑测试再改**：`python -m unittest discover -s tests -v`（覆盖 Contact Sheet 抽帧边界、Timeline bounds 校验、合成视频端到端、多素材增量、感知层契约解析/增量/降级）。
+- **感知层依赖（本机）**：whisper.cpp 在 `~/tools/whisper.cpp`（`build/bin/whisper-cli` + `models/ggml-small.bin`）；ollama 服务在 `127.0.0.1:11434`（模型 `qwen3-vl`）。路径在 `config.example.json` 的 `speech.bin/model` 与 `vision.host/model`。缺依赖时 ingest 自动降级警告，不阻断。
+- **感知层测试隔离**：核心流水线测试 mock 掉 `_ollama_available`/`_whisper_available`，感知层自身契约/增量/降级测试在 `tests/test_perception.py`（外部调用全部 mock）。
 - **可恢复执行**：每个阶段写独立文件，中断可从最后成功阶段继续；生产版需加 `stage-manifest.json`（输入哈希、配置哈希、工具版本、状态）。
 - **缓存**：每个阶段按输入哈希 + 配置哈希生成缓存键，未变化时复用。Media Index 建成后，改 Goal 不重新分析原片。
 - **新增阶段**：输出必须落在既有契约目录下（`analysis/`、`edit/`、`export/`），并写入 `stage-manifest.json`。

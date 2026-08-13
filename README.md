@@ -36,9 +36,10 @@ Validator 规则：`UNKNOWN_SHOT` / `SOURCE_BOUNDS` / `NON_POSITIVE_DURATION` / 
 
 ## 当前实现边界
 
-- ✅ 已实现：素材登记、Proxy、音频、Shot、Contact Sheet、Transcript 合并、Media Index、回退 Director、Timeline、Validator、适配载荷、Review HTML。
-- ⏳ 已定义未接通：Qwen3-VL 自动调用、whisper.cpp 自动执行、二级密集分析、LLM Director、真实 capcut-mate Writer。
-- 当前 Director 是确定性回退（按语音、质量分、有效时长排序，每 Shot 最多 8 秒），可离线运行、可测试，但叙事质量不代表最终 AI Director 水平。
+- ✅ 已实现：素材登记、Proxy、音频、Shot、Contact Sheet、Transcript（whisper.cpp）、视觉理解（ollama qwen3-vl）、Media Index、回退 Director、Timeline、CapCut 适配契约。
+- ⏳ 已定义未接通：二级密集分析（P4）、LLM Director（P3）、真实 capcut-mate Writer（P5）、Review UI（P6）。
+- 感知层（whisper/ollama）**自动执行、增量、可降级**：任一模型不可用或调用失败时，跳过该模态并警告，Media Index 仍以另一模态继续构建；已分析的素材/Shot 不再重复处理。
+- 当前 Director 是确定性回退（按有效时长排序，每 Shot 最多 8 秒），可离线运行、可测试，但叙事质量不代表最终 AI Director 水平。
 - 当前 CapCut 输出是稳定适配契约，不是可直接由剪映打开的原生 Draft。
 
 ## 路线图
