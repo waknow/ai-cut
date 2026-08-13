@@ -49,14 +49,39 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
-    """合并 transcript 与 Shot，重建 Media Index JSON/SQLite。"""
-    _not_implemented("index")
+    """从磁盘产物重建 Media Index（合并 transcript 与 Shot，JSON 权威）。"""
+    project = os.path.abspath(args.project)
+    if not os.path.isfile(os.path.join(project, "analysis", "shots.json")):
+        print("aicut: 错误：未找到 analysis/shots.json，请先执行 ingest", file=sys.stderr)
+        return 1
+    index = core.build_index(project)
+    out = os.path.join(project, "analysis", "media-index.json")
+    print(f"Media Index 已重建：{out}")
+    print(f"  sources: {len(index['sources'])} · shots: {len(index['shots'])} · "
+          f"transcript: {'有' if 'transcript' in index else '无'}")
     return 0
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
     """生成 Story Plan 与 Timeline IR。"""
-    _not_implemented("plan")
+    project = os.path.abspath(args.project)
+    media_index = core._read_json(os.path.join(project, "analysis", "media-index.json"))
+    if not media_index:
+        print("aicut: 错误：未找到 analysis/media-index.json，请先执行 ingest", file=sys.stderr)
+        return 1
+    result = core.plan(media_index, goal=args.goal, target_duration=args.target,
+                       config=core.load_config())
+    for rel, obj in (("edit/story-plan.json", result["story_plan"]),
+                     ("edit/timeline.json", result["timeline"])):
+        core._write_json(os.path.join(project, rel), obj)
+    tl = result["timeline"]
+    sp = result["story_plan"]
+    print(f"Story Plan 与 Timeline 已生成：{os.path.join(project, 'edit')}")
+    print(f"  目标 {tl['target_duration']:.0f}s · 成片 {tl['duration']:.1f}s · "
+          f"{len(tl['clips'])} 个片段")
+    for beat in sp["beats"]:
+        n = sum(1 for c in sp["candidates"] if c["beat_id"] == beat["id"])
+        print(f"  {beat['id']} {beat['name']}：目标 {beat['target_seconds']:.0f}s · {n} 个片段")
     return 0
 
 

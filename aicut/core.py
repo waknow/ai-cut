@@ -381,17 +381,126 @@ def ingest(project_dir: str, source: str | None = None, config: dict | None = No
 
 
 # ---------------------------------------------------------------------------
+# 阶段六/八：Director（确定性回退）与 Timeline IR（架构 §4.6/4.8）
+# ---------------------------------------------------------------------------
+
+DEFAULT_CLIP_MAX_SECONDS = 8.0  # 每 Shot 最多取 8 秒（架构 §4.6）
+
+
+def _story_beats(target_duration: float) -> list[dict]:
+    """叙事结构：开场 15% / 发展 70% / 收束 15%。"""
+    return [
+        {"id": "beat-01", "name": "开场", "intent": "建立场景，引入主题",
+         "target_seconds": round(target_duration * 0.15, 2)},
+        {"id": "beat-02", "name": "发展", "intent": "主体内容推进",
+         "target_seconds": round(target_duration * 0.70, 2)},
+        {"id": "beat-03", "name": "收束", "intent": "结尾收束",
+         "target_seconds": round(target_duration * 0.15, 2)},
+    ]
+
+
+def _select_clips(shots: list[dict], target_duration: float,
+                  max_clip_seconds: float = DEFAULT_CLIP_MAX_SECONDS) -> list[dict]:
+    """确定性回退选镜：按有效时长降序（稳定排序），每 Shot 最多取 max_clip_seconds。
+
+    超长 Shot 取中部片段（架构 §4.7 PoC 回退）。排序键未来可扩展为
+    （有语音, 质量分, 有效时长）——transcript/visual 就绪后替换。
+    """
+    ordered = sorted(enumerate(shots), key=lambda iv: (-iv[1]["duration"], iv[0]))
+    selected: list[dict] = []
+    used = 0.0
+    for rank, shot in ordered:
+        if used >= target_duration:
+            break
+        use = min(shot["duration"], max_clip_seconds)
+        if shot["duration"] > use:
+            mid = shot["start"] + (shot["duration"] - use) / 2
+            source_in, source_out = mid, mid + use
+        else:
+            source_in, source_out = shot["start"], shot["end"]
+        selected.append({
+            "shot": shot,
+            "source_in": round(source_in, 3),
+            "source_out": round(source_out, 3),
+            "use": round(use, 3),
+            "rank": rank,
+        })
+        used += use
+    return selected
+
+
+def plan(media_index: dict | None = None, goal: str = "", target_duration: float = 60.0,
+         config: dict | None = None) -> dict:
+    """确定性回退 Director：输出 Story Plan 与 Timeline IR 契约。
+
+    生产版以 LLM 替换选镜逻辑，但必须输出同一 Story Plan / Timeline IR 契约。
+    """
+    if target_duration <= 0:
+        raise ValueError(f"目标时长必须为正数：{target_duration}")
+    shots = (media_index or {}).get("shots", [])
+    if not shots:
+        raise ValueError("Media Index 中没有 Shot，请先执行 ingest")
+
+    selected = _select_clips(shots, target_duration)
+    beats = _story_beats(target_duration)
+
+    # Beat 分配：按时间线累计时长映射（开场→发展→收束）
+    beat_idx = 0
+    accumulated = 0.0
+    beat_threshold = beats[0]["target_seconds"]
+    candidates = []
+    for c in selected:
+        candidates.append({
+            "shot_id": c["shot"]["id"],
+            "source_id": c["shot"]["source_id"],
+            "duration": c["use"],
+            "beat_id": beats[beat_idx]["id"],
+            "reason": f"有效时长 {c['shot']['duration']:.1f}s，确定性回退排序第 {c['rank'] + 1}",
+        })
+        accumulated += c["use"]
+        if beat_idx < len(beats) - 1 and accumulated >= beat_threshold:
+            beat_idx += 1
+            beat_threshold += beats[beat_idx]["target_seconds"]
+
+    story_plan = {
+        "schema_version": "1.0",
+        "goal": goal,
+        "target_duration": target_duration,
+        "beats": beats,
+        "candidates": candidates,
+    }
+
+    timeline_in = 0.0
+    clips = []
+    for c in selected:
+        clips.append({
+            "id": f"clip-{len(clips) + 1:04d}",
+            "shot_id": c["shot"]["id"],
+            "source_in": c["source_in"],
+            "source_out": c["source_out"],
+            "timeline_in": round(timeline_in, 3),
+            "timeline_out": round(timeline_in + c["use"], 3),
+            "track": "V1",
+            "transition_out": 0.0,
+        })
+        timeline_in += c["use"]
+
+    timeline = {
+        "schema_version": "1.0",
+        "goal": goal,
+        "target_duration": target_duration,
+        "duration": round(timeline_in, 3),
+        "clips": clips,
+    }
+    return {"story_plan": story_plan, "timeline": timeline}
+
+
+# ---------------------------------------------------------------------------
 # 尚未实现的组件（下一步填充）
 # ---------------------------------------------------------------------------
 
 def import_transcript(wav: str | None = None, config: dict | None = None) -> dict:
     """Whisper/whisper.cpp 转录，标准化 segment/word 时间戳。"""
-    raise NotImplementedError
-
-
-def plan(media_index: dict | None = None, goal: str = "", target_duration: float = 60.0,
-         config: dict | None = None) -> dict:
-    """确定性回退 Director：按语音/质量分/有效时长排序，输出 Story Plan 与 Timeline IR。"""
     raise NotImplementedError
 
 
@@ -574,6 +683,10 @@ def build_index(project_dir: str | None = None, source_meta: dict | None = None,
         "sources": sources,
         "shots": shot_list,
     }
+    # 合并转录（whisper 就绪后由 import_transcript 生成 analysis/transcript.json）
+    transcript_data = _read_json(os.path.join(project_dir, "analysis", "transcript.json"))
+    if transcript_data is not None:
+        index["transcript"] = transcript_data
     if transcript is not None:
         index["transcript"] = transcript
     if visual is not None:

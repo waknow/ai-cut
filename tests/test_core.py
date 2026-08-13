@@ -6,7 +6,6 @@ from aicut import core
 # 尚未实现的组件（骨架占位，下一步填充）
 UNIMPLEMENTED = (
     "import_transcript",
-    "plan",
     "validate",
     "export",
 )
