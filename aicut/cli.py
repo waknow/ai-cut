@@ -133,6 +133,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"aicut: 错误：{exc}", file=sys.stderr)
         return 1
+    except FileNotFoundError as exc:
+        print(f"aicut: 错误：{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
