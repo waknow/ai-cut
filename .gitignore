@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# 项目运行产物（视频项目目录）
+project/
+media/
+proxy/
+audio/
+analysis/
+edit/
+export/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 本地配置
+config.json
