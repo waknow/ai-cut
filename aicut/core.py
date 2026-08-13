@@ -86,7 +86,9 @@ def _read_json(path: str, default=None):
 
 def _run(cmd: list[str], task: str) -> subprocess.CompletedProcess:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # 显式 UTF-8 + errors=replace：避免中文 Windows 默认 GBK 解码子进程输出时报错
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
     except FileNotFoundError:
         raise RuntimeError(f"{task} 失败：未找到命令 {cmd[0]}（请确认已安装）")
     if proc.returncode != 0:
