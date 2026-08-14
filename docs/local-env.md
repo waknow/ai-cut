@@ -33,8 +33,11 @@
      （tokenizer 资源 `whisper/assets/multilingual.tiktoken`、`mel_filters.npz`
      从 jsdelivr 拉取，放在 `~/tools/whisper.cpp/repo/whisper/assets/`）。
   保留 `small.pt`（483MB）以防需要重转。
-- **qwen3-vl**：`ollama pull qwen3-vl`（6.1GB，registry.ollama.ai 可达）。
-  首次推理含模型加载，本机 16GB 内存 + 部分 GPU 卸载下单个请求约 3–5 分钟属正常。
+- **qwen2.5vl:3b**：`ollama pull qwen2.5vl:3b`（3.2GB），本机视觉模型。GTX 1660
+  SUPER（4GB 显存）下 100% GPU 卸载，热启动约 2s/张，5 个 Shot 全量重分析约
+  52s（qwen3-vl 6.1GB 只能部分卸载，单请求 3–5 分钟，已弃用但保留在 ollama 中，
+  可用 `ollama rm qwen3-vl` 释放 6.1GB）。小模型常按 0–10 分制输出
+  `quality.score`，`understand_shot` 已做程序化归一化到 0.0–1.0（不信任模型数字）。
 
 ## 本地配置
 

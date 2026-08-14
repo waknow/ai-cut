@@ -541,6 +541,16 @@ def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
     data.setdefault("quality", {"score": 0.5, "issues": []})
     data.setdefault("mood", "")
     data.setdefault("tags", [])
+    # 契约要求 quality.score 为 0.0-1.0；小模型常输出 0-10 分制，程序化归一化（不信任模型数字）
+    quality = data.get("quality") or {}
+    try:
+        score = float(quality.get("score", 0.5))
+    except (TypeError, ValueError):
+        score = 0.5
+    if score > 1.0:
+        score /= 10.0
+    quality["score"] = max(0.0, min(1.0, score))
+    data["quality"] = quality
     return data
 
 

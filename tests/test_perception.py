@@ -117,8 +117,23 @@ class UnderstandShotTest(unittest.TestCase):
         self.assertEqual(result["quality"]["score"], 0.82)
         # 请求应包含图片 base64
         payload = mock_post.call_args[1]["json"]
-        self.assertEqual(payload["model"], "qwen3-vl")
+        self.assertEqual(payload["model"], "qwen2.5vl:3b")
         self.assertTrue(payload["images"][0].startswith("/9j/"))  # JPEG base64 头
+
+    def test_understand_shot_normalizes_quality_score(self):
+        # 小模型常按 0-10 分制输出，契约要求 0.0-1.0，程序化归一化
+        fake_response = {"summary": "x", "quality": {"score": 7, "issues": []}}
+        with mock.patch("requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"response": json.dumps(fake_response)}
+            mock_post.return_value.raise_for_status = lambda: None
+            result = core.understand_shot(self.sheet, self.config)
+        self.assertEqual(result["quality"]["score"], 0.7)
+        # 字符串/越界也归一化到 [0,1]
+        for raw, expected in (("9", 0.9), ("abc", 0.5), (1.5, 0.15), (-0.2, 0.0)):
+            with mock.patch("requests.post") as mp:
+                mp.return_value.json.return_value = {"response": json.dumps({"quality": {"score": raw}})}
+                mp.return_value.raise_for_status = lambda: None
+                self.assertEqual(core.understand_shot(self.sheet, self.config)["quality"]["score"], expected)
 
     def test_understand_shot_fills_defaults(self):
         with mock.patch("requests.post") as mock_post:
