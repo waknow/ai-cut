@@ -24,5 +24,14 @@
     "minimum_quality": 0.35,
     "target_duration_tolerance_ratio": 0.08,
     "target_duration_tolerance_seconds": 2
+  },
+  "director": {
+    "engine": "auto",
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "temperature": 0.3,
+    "max_tokens": 8192,
+    "rank": true
   }
 }

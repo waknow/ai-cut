@@ -93,6 +93,12 @@ class MatchScoreTest(unittest.TestCase):
 
 class DirectGoalTest(unittest.TestCase):
 
+    def _ollama_config(self):
+        """无 director 配置 → _direct_goal 走本地 ollama 后端。"""
+        cfg = core.load_config()
+        cfg.pop("director", None)
+        return cfg
+
     def _fake_resp(self, text):
         m = mock.Mock()
         m.json.return_value = {"response": text}
@@ -113,7 +119,7 @@ class DirectGoalTest(unittest.TestCase):
             ],
         }
         with mock.patch("requests.post", return_value=self._fake_resp(json.dumps(fake, ensure_ascii=False))):
-            directed = core._direct_goal("婚礼记录", 60.0, core.load_config())
+            directed = core._direct_goal("婚礼记录", 60.0, self._ollama_config())
         self.assertEqual(directed["hard_constraints"], ["不使用模糊镜头"])
         beats = directed["beats"]
         self.assertEqual(len(beats), 3)
@@ -130,7 +136,7 @@ class DirectGoalTest(unittest.TestCase):
             {"name": "b", "query": "y", "target_ratio": 1.0},
         ]}
         with mock.patch("requests.post", return_value=self._fake_resp(json.dumps(fake))):
-            directed = core._direct_goal("g", 30.0, core.load_config())
+            directed = core._direct_goal("g", 30.0, self._ollama_config())
         seconds = [b["target_seconds"] for b in directed["beats"]]
         self.assertAlmostEqual(sum(seconds), 30.0, delta=0.1)
         self.assertAlmostEqual(seconds[0], seconds[1], delta=0.1)
@@ -138,23 +144,23 @@ class DirectGoalTest(unittest.TestCase):
     def test_missing_ratio_defaults_equal(self):
         fake = {"beats": [{"name": "a", "query": "x"}, {"name": "b", "query": "y"}]}
         with mock.patch("requests.post", return_value=self._fake_resp(json.dumps(fake))):
-            directed = core._direct_goal("g", 20.0, core.load_config())
+            directed = core._direct_goal("g", 20.0, self._ollama_config())
         self.assertAlmostEqual(directed["beats"][0]["target_seconds"], 10.0, delta=0.1)
 
     def test_invalid_json_raises(self):
         with mock.patch("requests.post", return_value=self._fake_resp("not json at all")):
             with self.assertRaises(RuntimeError):
-                core._direct_goal("g", 10.0, core.load_config())
+                core._direct_goal("g", 10.0, self._ollama_config())
 
     def test_missing_beats_raises(self):
         with mock.patch("requests.post", return_value=self._fake_resp('{"hard_constraints": []}')):
             with self.assertRaises(RuntimeError):
-                core._direct_goal("g", 10.0, core.load_config())
+                core._direct_goal("g", 10.0, self._ollama_config())
 
     def test_ollama_request_failure_raises(self):
         with mock.patch("requests.post", side_effect=RuntimeError("conn refused")):
             with self.assertRaises(RuntimeError):
-                core._direct_goal("g", 10.0, core.load_config())
+                core._direct_goal("g", 10.0, self._ollama_config())
 
 
 class HardConstraintTest(unittest.TestCase):
@@ -225,7 +231,9 @@ class PlanLlmPathTest(unittest.TestCase):
         ], transcript_text="谢谢大家 今天 见证")
         directed = make_directed()
         with mock.patch.object(core, "_direct_goal", return_value=directed), \
-                mock.patch.object(core, "_ollama_available", return_value=True):
+                mock.patch.object(core, "_ollama_available", return_value=True), \
+                mock.patch.object(core, "_rank_beat_candidates",
+                                  side_effect=lambda b, c, m, d: c):
             result = core.plan(index, goal="60 秒婚礼记录", target_duration=60.0,
                                config=core.load_config())
         sp = result["story_plan"]
@@ -259,7 +267,9 @@ class PlanLlmPathTest(unittest.TestCase):
         ])
         directed = make_directed()
         with mock.patch.object(core, "_direct_goal", return_value=directed), \
-                mock.patch.object(core, "_ollama_available", return_value=True):
+                mock.patch.object(core, "_ollama_available", return_value=True), \
+                mock.patch.object(core, "_rank_beat_candidates",
+                                  side_effect=lambda b, c, m, d: c):
             a = core.plan(index, goal="g", target_duration=30.0, config=core.load_config())
             b = core.plan(index, goal="g", target_duration=30.0, config=core.load_config())
         self.assertEqual(a["timeline"]["clips"], b["timeline"]["clips"])
@@ -295,6 +305,178 @@ class PlanLlmPathTest(unittest.TestCase):
             result = core.plan(index, goal="g", target_duration=10.0, config=core.load_config())
         self.assertGreaterEqual(len(result["timeline"]["clips"]), 1)
         self.assertEqual(result["story_plan"]["schema_version"], "1.0")
+
+
+class ExternalDirectorTest(unittest.TestCase):
+    """外部大模型（OpenAI 兼容 /chat/completions）Director 后端。"""
+
+    def _config(self):
+        cfg = core.load_config()
+        cfg["director"] = {
+            "engine": "external",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "api_key": "sk-test-key",
+            "model": "deepseek-v4-flash",
+            "temperature": 0.3,
+            "max_tokens": 8192,
+        }
+        return cfg
+
+    def _mock_chat(self, content):
+        m = mock.Mock()
+        m.json.return_value = {"choices": [{"message": {"content": content}}]}
+        m.raise_for_status = lambda: None
+        return m
+
+    def test_external_endpoint_and_parsing(self):
+        fake = {"beats": [{"name": "开场", "query": "场地", "target_ratio": 1.0}]}
+        with mock.patch("requests.post", return_value=self._mock_chat(json.dumps(fake, ensure_ascii=False))) as mp:
+            directed = core._direct_goal("旅行", 30.0, self._config())
+        # 请求格式：Bearer + /chat/completions + model + messages
+        call = mp.call_args
+        self.assertEqual(call.args[0], "https://opencode.ai/zen/go/v1/chat/completions")
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer sk-test-key")
+        body = call.kwargs["json"]
+        self.assertEqual(body["model"], "deepseek-v4-flash")
+        self.assertIn("开场", body["messages"][0]["content"])
+        self.assertEqual(directed["beats"][0]["target_seconds"], 30.0)
+
+    def test_external_empty_content_raises(self):
+        # 推理模型思考未结束时 content 为空 → RuntimeError（plan 层会降级）
+        with mock.patch("requests.post", return_value=self._mock_chat("")):
+            with self.assertRaises(RuntimeError):
+                core._direct_goal("旅行", 30.0, self._config())
+
+    def test_external_request_failure_raises(self):
+        with mock.patch("requests.post", side_effect=RuntimeError("network down")):
+            with self.assertRaises(RuntimeError):
+                core._direct_goal("旅行", 30.0, self._config())
+
+    def test_dispatch_to_external_when_configured(self):
+        with mock.patch.object(core, "_direct_goal_external") as ext, \
+                mock.patch.object(core, "_direct_goal_ollama") as oll:
+            core._direct_goal("g", 10.0, self._config())
+        ext.assert_called_once()
+        oll.assert_not_called()
+
+    def test_dispatch_to_ollama_when_not_configured(self):
+        cfg = core.load_config()
+        cfg.pop("director", None)
+        with mock.patch.object(core, "_direct_goal_external") as ext, \
+                mock.patch.object(core, "_direct_goal_ollama") as oll:
+            core._direct_goal("g", 10.0, cfg)
+        oll.assert_called_once()
+        ext.assert_not_called()
+
+    def test_plan_uses_external_director(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场", ["婚礼"], 0.9),
+        ])
+        directed = make_directed()
+        with mock.patch.object(core, "_direct_goal", return_value=directed) as dg, \
+                mock.patch.object(core, "_ollama_available", return_value=True), \
+                mock.patch.object(core, "_rank_beat_candidates",
+                                  side_effect=lambda b, c, m, d: c):
+            result = core.plan(index, goal="g", target_duration=30.0, config=self._config())
+        dg.assert_called_once()
+        self.assertGreaterEqual(len(result["timeline"]["clips"]), 1)
+
+
+class RankCandidatesTest(unittest.TestCase):
+    """外部 LLM 对 Beat 候选的语义重排。"""
+
+    def _config(self):
+        cfg = core.load_config()
+        cfg["director"] = {
+            "engine": "external",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "api_key": "sk-test",
+            "model": "deepseek-v4-flash",
+            "rank": True,
+        }
+        return cfg
+
+    def _chosen(self, index, shot_ids):
+        by_id = {s["id"]: s for s in index["shots"]}
+        out = []
+        for sid in shot_ids:
+            s = by_id[sid]
+            out.append({"shot": s, "source_in": s["start"], "source_out": s["end"],
+                        "use": s["duration"], "beat_id": "beat-01",
+                        "reason": "程序化理由", "score": 1.0})
+        return out
+
+    def _mock_chat(self, ranking):
+        m = mock.Mock()
+        m.json.return_value = {"choices": [{"message": {
+            "content": json.dumps({"ranking": ranking}, ensure_ascii=False)}}]}
+        m.raise_for_status = lambda: None
+        return m
+
+    def test_reorder_and_reason(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场 宣誓", ["婚礼"], 0.9),
+            ("shot-00002", 10, 20, 10, "宾客 举杯", ["宾客"], 0.9),
+        ])
+        beat = {"id": "beat-01", "name": "仪式", "intent": "仪式感", "query": "婚礼"}
+        chosen = self._chosen(index, ["shot-00001", "shot-00002"])
+        ranking = [
+            {"shot_id": "shot-00002", "score": 9, "reason": "宾客举杯更有氛围"},
+            {"shot_id": "shot-00001", "score": 7, "reason": "仪式宣誓镜头"},
+        ]
+        with mock.patch("requests.post", return_value=self._mock_chat(ranking)) as mp:
+            out = core._rank_beat_candidates(beat, chosen, index, self._config()["director"])
+        self.assertEqual([c["shot"]["id"] for c in out], ["shot-00002", "shot-00001"])
+        self.assertEqual(out[0]["reason"], "宾客举杯更有氛围")
+        # 请求包含节拍与候选摘要
+        body = mp.call_args.kwargs["json"]
+        self.assertIn("举杯", body["messages"][0]["content"])
+        self.assertIn("仪式", body["messages"][0]["content"])
+
+    def test_failure_keeps_original_order(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场", ["婚礼"], 0.9),
+        ])
+        beat = {"id": "beat-01", "name": "x", "intent": "x", "query": "x"}
+        chosen = self._chosen(index, ["shot-00001"])
+        with mock.patch("requests.post", side_effect=RuntimeError("net down")):
+            out = core._rank_beat_candidates(beat, chosen, index, self._config()["director"])
+        self.assertEqual(out, chosen)
+
+    def test_ranking_invalid_json_keeps_order(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场", ["婚礼"], 0.9),
+        ])
+        beat = {"id": "beat-01", "name": "x", "intent": "x", "query": "x"}
+        chosen = self._chosen(index, ["shot-00001"])
+        m = mock.Mock()
+        m.json.return_value = {"choices": [{"message": {"content": "garbage"}}]}
+        m.raise_for_status = lambda: None
+        with mock.patch("requests.post", return_value=m):
+            out = core._rank_beat_candidates(beat, chosen, index, self._config()["director"])
+        self.assertEqual(out, chosen)
+
+    def test_retrieve_ranks_when_configured(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场", ["婚礼"], 0.9),
+        ])
+        directed = make_directed()
+        cfg = self._config()
+        with mock.patch.object(core, "_rank_beat_candidates",
+                               side_effect=lambda b, c, m, d: c) as rk:
+            cands = core._retrieve_shots(index, directed["beats"], directed, cfg, cfg["director"])
+        self.assertGreater(rk.call_count, 0)
+        self.assertTrue(cands)
+
+    def test_retrieve_skips_ranking_when_not_configured(self):
+        index = make_index([
+            ("shot-00001", 0, 10, 10, "婚礼现场", ["婚礼"], 0.9),
+        ])
+        directed = make_directed()
+        with mock.patch.object(core, "_rank_beat_candidates") as rk:
+            cands = core._retrieve_shots(index, directed["beats"], directed, core.load_config())
+        rk.assert_not_called()
+        self.assertTrue(cands)
 
 
 if __name__ == "__main__":

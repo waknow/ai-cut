@@ -486,7 +486,13 @@ python -m aicut run demo /absolute/path/video.mp4 \
 
 - 已实现：素材登记、Proxy、音频、Shot、Contact Sheet、Transcript 合并、Media Index、LLM Director（Goal 拆解 + 叙事 Beat + 程序化检索，可降级回退）、Timeline、Validator、适配载荷和 Review 页面。
 - 已定义但尚未接通：二级密集分析、真实 capcut-mate Writer。
-- Director 默认走 LLM（qwen2.5vl 文本推理）：把 Goal 拆为硬约束/软偏好与叙事 Beat，程序按 Beat query 对视觉摘要+语音文本做中文匹配检索（整词 2 分 + 字符 bigram 1 分，叠加质量分、语音加分与硬约束罚分），每个 Shot 全局归属匹配分最高的 Beat，无匹配的 Beat 按质量兑底，候选记录选择理由与备选；ollama 不可用或无语义数据时回退确定性排序（按有效时长降序，每 Shot 最多 8 秒），同一 Story Plan / Timeline IR 契约。
+- Director 默认走外部大模型（`config.json` 的 `director` 段，OpenAI 兼容
+  `/chat/completions`，本机配 opencode-go 的 `deepseek-v4-flash`，key 只在本地
+  `config.json`，未入库）：Goal 拆硬约束/软偏好与叙事 Beat → 程序化检索（整词 2 分
+  + 字符 bigram 1 分，质量分/语音加分，质量类硬约束罚 100 硬阻断、内容类每条罚 5
+  软性、转场/节奏等编辑约束不参与镜头检索）→ 外部模型对每个 Beat 候选语义重排并写理由。
+  外部不可用 → 本地 ollama 同模型 → 确定性回退，同一 Story Plan / Timeline IR 契约。
+  图片理解（Contact Sheet）始终走本地 qwen2.5vl。
 - 当前 CapCut 文件是稳定适配契约，不是直接可由剪映打开的原生 Draft。
 
 ## 14. 推荐实施顺序

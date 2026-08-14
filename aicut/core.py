@@ -56,6 +56,15 @@ DEFAULT_CONFIG = {
         "coarse_mode": "contact_sheet",
         "dense_candidate_fps": 3,
     },
+    "director": {
+        "engine": "auto",
+        "base_url": "",
+        "api_key": "",
+        "model": "",
+        "temperature": 0.3,
+        "max_tokens": 8192,
+        "rank": True,
+    },
     "validation": {
         "minimum_quality": 0.35,
         "target_duration_tolerance_ratio": 0.08,
@@ -658,7 +667,9 @@ def plan(media_index: dict | None = None, goal: str = "", target_duration: float
     if has_semantics and _ollama_available(config):
         try:
             directed = _direct_goal(goal, target_duration, config)
-            candidates = _retrieve_shots(media_index, directed["beats"], directed, config)
+            director_cfg = config.get("director") or {}
+            candidates = _retrieve_shots(media_index, directed["beats"], directed, config,
+                                         director_cfg)
             if candidates:
                 return _compose_plan(candidates, goal, target_duration, directed, media_index)
             raise RuntimeError("检索未产生任何候选")
@@ -737,25 +748,21 @@ DIRECTOR_PROMPT = (
 def _direct_goal(goal: str, target_duration: float, config: dict) -> dict:
     """LLM Goal 解析：拆硬约束/软偏好，生成叙事 Beat（含检索 query 与时长占比）。
 
-    返回 {hard_constraints, soft_preferences, beats}；beats 的 target_seconds 由
-    程序按占比归一化计算（不信任模型数字）。失败抛 RuntimeError。
+    后端选择：config.director 配置了外部 OpenAI 兼容端点（engine=external 或 auto）
+    则走外部大模型；否则走本地 ollama。返回 {hard_constraints, soft_preferences,
+    beats}；beats 的 target_seconds 由程序按占比归一化（不信任模型数字）。
+    失败抛 RuntimeError（plan 层降级回退）。
     """
-    import requests
+    director = config.get("director") or {}
+    engine = director.get("engine", "auto")
+    if engine == "external" or (engine == "auto"
+                                and director.get("base_url") and director.get("api_key")):
+        return _direct_goal_external(goal, target_duration, director)
+    return _direct_goal_ollama(goal, target_duration, config)
 
-    vision = config.get("vision", {})
-    host = vision.get("host", "http://127.0.0.1:11434")
-    model = vision.get("model", "qwen2.5vl:3b")
-    prompt = DIRECTOR_PROMPT.format(goal=goal, target_seconds=int(round(target_duration)))
-    payload: dict = {"model": model, "prompt": prompt, "stream": False}
-    num_gpu = vision.get("num_gpu")
-    if num_gpu is not None:
-        payload["options"] = {"num_gpu": num_gpu}
-    try:
-        resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
-        resp.raise_for_status()
-        text = resp.json().get("response", "")
-    except Exception as exc:
-        raise RuntimeError(f"ollama 调用失败：{exc}")
+
+def _parse_directed(text: str, goal: str, target_duration: float) -> dict:
+    """解析并归一化 Director 输出：JSON 容错 + target_ratio 程序化换算。"""
     data = _extract_json(text)
     if not isinstance(data, dict):
         raise RuntimeError(f"LLM Director 输出不是合法 JSON：{text[:200]}")
@@ -785,6 +792,56 @@ def _direct_goal(goal: str, target_duration: float, config: dict) -> dict:
         "soft_preferences": data.get("soft_preferences") or [],
         "beats": beats,
     }
+
+
+def _direct_goal_external(goal: str, target_duration: float, director: dict) -> dict:
+    """外部大模型 Goal 解析：OpenAI 兼容 /chat/completions（如 opencode-go）。"""
+    import requests
+
+    base = str(director.get("base_url", "")).rstrip("/")
+    model = director.get("model") or "deepseek-v4-flash"
+    if not base or not director.get("api_key"):
+        raise RuntimeError("未配置外部 Director 端点（director.base_url / api_key）")
+    prompt = DIRECTOR_PROMPT.format(goal=goal, target_seconds=int(round(target_duration)))
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(director.get("max_tokens", 8192)),
+        "temperature": float(director.get("temperature", 0.3)),
+    }
+    headers = {"Authorization": f"Bearer {director['api_key']}"}
+    try:
+        resp = requests.post(f"{base}/chat/completions", json=payload,
+                             headers=headers, timeout=600)
+        resp.raise_for_status()
+        msg = (resp.json().get("choices") or [{}])[0].get("message") or {}
+        text = msg.get("content") or ""
+        if not text:
+            raise RuntimeError("外部模型未返回 content（可能是推理模型思考未完成）")
+    except Exception as exc:
+        raise RuntimeError(f"外部 Director 模型调用失败：{exc}")
+    return _parse_directed(text, goal, target_duration)
+
+
+def _direct_goal_ollama(goal: str, target_duration: float, config: dict) -> dict:
+    """本地 ollama Goal 解析（与视觉同一模型，含 num_gpu 配置）。"""
+    import requests
+
+    vision = config.get("vision", {})
+    host = vision.get("host", "http://127.0.0.1:11434")
+    model = vision.get("model", "qwen2.5vl:3b")
+    prompt = DIRECTOR_PROMPT.format(goal=goal, target_seconds=int(round(target_duration)))
+    payload: dict = {"model": model, "prompt": prompt, "stream": False}
+    num_gpu = vision.get("num_gpu")
+    if num_gpu is not None:
+        payload["options"] = {"num_gpu": num_gpu}
+    try:
+        resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
+        resp.raise_for_status()
+        text = resp.json().get("response", "")
+    except Exception as exc:
+        raise RuntimeError(f"ollama 调用失败：{exc}")
+    return _parse_directed(text, goal, target_duration)
 
 
 def _shot_context(media_index: dict, shot: dict) -> tuple[str, str]:
@@ -829,8 +886,13 @@ def _match_score(query: str, text: str) -> float:
     return score
 
 
-def _hard_constraint_penalty(constraints: list, shot: dict, media_index: dict) -> float:
-    """硬约束近似：质量类约束命中 issues/低分时重罚；'必须包含 X' 未命中时重罚。"""
+def _hard_constraint_penalty(constraints: list, shot: dict, media_index: dict) -> tuple[float, float]:
+    """硬约束罚分：返回 (quality_penalty, content_penalty)。
+
+    - 质量类约束（模糊/虚焦/抖动等）命中 issues 或质量分过低 → 100（硬阻断）。
+    - 内容类约束（必须包含 X）未命中 → 每条 5（软性，不压过语义匹配分）。
+    - 编辑层约束（转场/节奏/音乐/字幕等）与镜头选择无关，不参与罚分。
+    """
     import re
 
     visual = ((media_index.get("visual") or {}).get("shots") or {}).get(shot["id"], {})
@@ -840,13 +902,17 @@ def _hard_constraint_penalty(constraints: list, shot: dict, media_index: dict) -
     ctx, _ = _shot_context(media_index, shot)
     quality_kw = ("模糊", "虚焦", "过暗", "抖动", "失焦", "欠曝")
     stop_kw = ("必须", "一定要", "需要", "包含", "含有", "包括", "不使用", "避免", "不能", "禁止")
-    penalty = 0.0
+    edit_kw = ("转场", "效果", "节奏", "音乐", "字幕", "配音", "片头", "片尾", "调色")
+    quality_penalty = 0.0
+    content_penalty = 0.0
     for c in constraints:
         c = str(c)
+        if any(k in c for k in edit_kw):
+            continue  # 编辑层约束交 Validator/后续阶段，不影响镜头检索
         if any(k in c for k in quality_kw):
             # 质量类约束：只按 issues/质量分判断，不再做内容词检查
             if any(k in issues for k in quality_kw) or score < 0.5:
-                penalty += 100.0
+                quality_penalty = max(quality_penalty, 100.0)
             continue
         words = []
         for run in re.findall(r"[\u4e00-\u9fff]+", c):
@@ -855,16 +921,21 @@ def _hard_constraint_penalty(constraints: list, shot: dict, media_index: dict) -
             # 2 字滑窗："婚礼环节" 命中含 "婚礼" 或 "环节" 的上下文
             words.extend(run[i:i + 2] for i in range(len(run) - 1))
         if words and not any(w in ctx for w in words):
-            penalty += 50.0
-    return penalty
+            content_penalty += 5.0
+    return quality_penalty, min(content_penalty, 15.0)
 
 
-def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config: dict) -> list[dict]:
+def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config: dict,
+                    director: dict | None = None) -> list[dict]:
     """按 Beat 检索候选：语义匹配全局归属 + 质量/语音加分 − 硬约束罚分。
 
     每个 Shot 先归属语义匹配分最高的 Beat（避免无关 Beat 抢镜），
     Beat 内按（匹配分, 质量）排序取候选；无匹配的 Beat 才按质量兜底。
+    外部大模型已配置（director.rank）时，再对每个 Beat 候选做 LLM 语义重排。
     """
+    director = director or {}
+    rank_with_llm = bool(director.get("base_url") and director.get("api_key"))
+    rank_with_llm = rank_with_llm and director.get("rank", True)
     shots = media_index.get("shots", [])
     by_id = {s["id"]: s for s in shots}
     constraints = directed.get("hard_constraints") or []
@@ -876,8 +947,10 @@ def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config
         ctx, speech = _shot_context(media_index, shot)
         visual = ((media_index.get("visual") or {}).get("shots") or {}).get(shot["id"], {})
         q = float(((visual.get("quality") or {}).get("score", 0.5)))
-        penalty = _hard_constraint_penalty(constraints, shot, media_index)
-        info[shot["id"]] = {"ctx": ctx, "speech": speech, "q": q, "penalty": penalty}
+        q_pen, c_pen = _hard_constraint_penalty(constraints, shot, media_index)
+        info[shot["id"]] = {"ctx": ctx, "speech": speech, "q": q,
+                            "quality_penalty": q_pen, "content_penalty": c_pen,
+                            "penalty": q_pen + c_pen}
         for beat in beats:
             query = beat.get("query") or beat.get("intent") or beat.get("name", "")
             match[(shot["id"], beat["id"])] = _match_score(query, ctx)
@@ -943,7 +1016,8 @@ def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config
                 if shot["id"] in used:
                     continue
                 info_ = info[shot["id"]]
-                if info_["penalty"] >= 100.0:
+                # 只躲真正的质量违规（硬阻断）；内容类软约束不阻止兜底
+                if info_["quality_penalty"] >= 100.0:
                     continue
                 # 该镜头若匹配其他 Beat 则留给对应 Beat
                 if any(match[(shot["id"], b["id"])] > 0
@@ -955,8 +1029,77 @@ def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config
             c["beat_id"] = beat["id"]
             # 备选：同 Beat 未入选的次优（语义匹配）候选
             c["alternatives"] = [sid for sid, _ in pool if sid != c["shot"]["id"]][:3]
+        if rank_with_llm:
+            chosen = _rank_beat_candidates(beat, chosen, media_index, director)
         candidates.extend(chosen)
     return candidates
+
+
+RANK_PROMPT = (
+    "你是视频剪辑导演。为叙事节拍挑选最合适的镜头（仅从给定候选中选，可全选）。"
+    "只输出 JSON（不要任何其他文字）：\n"
+    '{{"ranking": [{{"shot_id": "镜头ID", "score": 0-10, "reason": "选择理由（中文，30字内）"}}]}}\n'
+    "节拍：{beat_name}（意图：{intent}；检索词：{query}）\n"
+    "候选镜头：\n{shots}"
+)
+
+
+def _rank_beat_candidates(beat: dict, chosen: list[dict], media_index: dict,
+                          director: dict) -> list[dict]:
+    """外部大模型对 Beat 候选做语义排序并改写理由（失败时原样返回）。"""
+    import requests
+
+    base = str(director.get("base_url", "")).rstrip("/")
+    if not base or not director.get("api_key"):
+        return chosen
+    lines = []
+    for i, c in enumerate(chosen, 1):
+        visual = ((media_index.get("visual") or {}).get("shots") or {}).get(c["shot"]["id"], {})
+        summary = (visual.get("summary") or "").strip()
+        tags = " ".join(visual.get("tags", []) or [])
+        segs = ((media_index.get("transcript") or {}).get("sources") or {})
+        speech = " ".join(
+            s.get("text", "") for s in (segs.get(c["shot"]["source_id"], {}) or {}).get("segments", []) or []
+            if s.get("start", 0) < c["shot"].get("end", 0) and s.get("end", 0) > c["shot"].get("start", 0)
+        )[:60]
+        lines.append(f"{i}. {c['shot']['id']}：画面={summary}；标签={tags}；语音={speech}")
+    prompt = RANK_PROMPT.format(beat_name=beat.get("name", ""),
+                                intent=beat.get("intent", ""),
+                                query=beat.get("query", ""),
+                                shots="\n".join(lines))
+    payload = {
+        "model": director.get("model") or "deepseek-v4-flash",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(director.get("max_tokens", 8192)),
+        "temperature": float(director.get("temperature", 0.3)),
+    }
+    headers = {"Authorization": f"Bearer {director['api_key']}"}
+    try:
+        resp = requests.post(f"{base}/chat/completions", json=payload,
+                             headers=headers, timeout=600)
+        resp.raise_for_status()
+        msg = (resp.json().get("choices") or [{}])[0].get("message") or {}
+        text = msg.get("content") or ""
+    except Exception:
+        return chosen
+    data = _extract_json(text)
+    ranking = data.get("ranking") if isinstance(data, dict) else None
+    if not isinstance(ranking, list):
+        return chosen
+    by_id = {c["shot"]["id"]: c for c in chosen}
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for item in ranking:
+        sid = str(item.get("shot_id", ""))
+        if sid in by_id and sid not in seen:
+            c = by_id[sid]
+            reason = str(item.get("reason", "")).strip()
+            if reason:
+                c["reason"] = reason
+            ordered.append(c)
+            seen.add(sid)
+    ordered += [c for c in chosen if c["shot"]["id"] not in seen]
+    return ordered
 
 
 def _make_clip(shot: dict, source_in: float, source_out: float,
