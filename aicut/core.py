@@ -525,6 +525,10 @@ def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
         "images": [b64],
         "stream": False,
     }
+    num_gpu = vision.get("num_gpu")
+    if num_gpu is not None:
+        # 0=强制 CPU：GTX 1660 SUPER 上 qwen2.5vl 视觉投影器 GPU 推理会退化输出 @@@，CPU 正常
+        payload["options"] = {"num_gpu": num_gpu}
     try:
         resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
         resp.raise_for_status()
@@ -541,8 +545,10 @@ def understand_shot(contact_sheet: str, config: dict | None = None) -> dict:
     data.setdefault("quality", {"score": 0.5, "issues": []})
     data.setdefault("mood", "")
     data.setdefault("tags", [])
-    # 契约要求 quality.score 为 0.0-1.0；小模型常输出 0-10 分制，程序化归一化（不信任模型数字）
-    quality = data.get("quality") or {}
+    # 契约要求 quality.score 为 0.0-1.0；小模型常输出 0-10 分制或字符串，程序化归一化（不信任模型数字）
+    quality = data.get("quality")
+    if not isinstance(quality, dict):
+        quality = {"score": 0.5, "issues": []}
     try:
         score = float(quality.get("score", 0.5))
     except (TypeError, ValueError):

@@ -119,6 +119,8 @@ class UnderstandShotTest(unittest.TestCase):
         payload = mock_post.call_args[1]["json"]
         self.assertEqual(payload["model"], "qwen2.5vl:3b")
         self.assertTrue(payload["images"][0].startswith("/9j/"))  # JPEG base64 头
+        # 本地配置强制 CPU 推理（GPU 视觉退化规避）
+        self.assertEqual(payload.get("options", {}).get("num_gpu"), 0)
 
     def test_understand_shot_normalizes_quality_score(self):
         # 小模型常按 0-10 分制输出，契约要求 0.0-1.0，程序化归一化
@@ -134,6 +136,14 @@ class UnderstandShotTest(unittest.TestCase):
                 mp.return_value.json.return_value = {"response": json.dumps({"quality": {"score": raw}})}
                 mp.return_value.raise_for_status = lambda: None
                 self.assertEqual(core.understand_shot(self.sheet, self.config)["quality"]["score"], expected)
+        # quality 整体是字符串/缺省时回退默认
+        for raw in ("7", None, 5, []):
+            with mock.patch("requests.post") as mp:
+                mp.return_value.json.return_value = {"response": json.dumps({"quality": raw})}
+                mp.return_value.raise_for_status = lambda: None
+                res = core.understand_shot(self.sheet, self.config)["quality"]
+                self.assertIsInstance(res, dict)
+                self.assertEqual(res["score"], 0.5)
 
     def test_understand_shot_fills_defaults(self):
         with mock.patch("requests.post") as mock_post:
