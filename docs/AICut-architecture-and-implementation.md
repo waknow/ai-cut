@@ -484,9 +484,9 @@ python -m aicut run demo /absolute/path/video.mp4 \
 
 当前仓库是一条已经实际跑通的 PoC 纵向切片，而不是全部生产能力：
 
-- 已实现：素材登记、Proxy、音频、Shot、Contact Sheet、Transcript 合并、Media Index、回退 Director、Timeline、Validator、适配载荷和 Review 页面。
-- 已定义但尚未接通：Qwen3-VL 自动调用、whisper.cpp 自动执行、二级密集分析、LLM Director、真实 capcut-mate Writer。
-- 当前 Director 用确定性排序保证离线可运行，因此输出可测试，但叙事质量不代表最终 AI Director 水平。
+- 已实现：素材登记、Proxy、音频、Shot、Contact Sheet、Transcript 合并、Media Index、LLM Director（Goal 拆解 + 叙事 Beat + 程序化检索，可降级回退）、Timeline、Validator、适配载荷和 Review 页面。
+- 已定义但尚未接通：二级密集分析、真实 capcut-mate Writer。
+- Director 默认走 LLM（qwen2.5vl 文本推理）：把 Goal 拆为硬约束/软偏好与叙事 Beat，程序按 Beat query 对视觉摘要+语音文本做中文匹配检索（整词 2 分 + 字符 bigram 1 分，叠加质量分、语音加分与硬约束罚分），每个 Shot 全局归属匹配分最高的 Beat，无匹配的 Beat 按质量兑底，候选记录选择理由与备选；ollama 不可用或无语义数据时回退确定性排序（按有效时长降序，每 Shot 最多 8 秒），同一 Story Plan / Timeline IR 契约。
 - 当前 CapCut 文件是稳定适配契约，不是直接可由剪映打开的原生 Draft。
 
 ## 14. 推荐实施顺序

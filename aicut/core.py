@@ -641,16 +641,35 @@ def _select_clips(shots: list[dict], target_duration: float,
 
 def plan(media_index: dict | None = None, goal: str = "", target_duration: float = 60.0,
          config: dict | None = None) -> dict:
-    """确定性回退 Director：输出 Story Plan 与 Timeline IR 契约。
+    """Director：LLM Goal 解析 → 叙事 Beat → 程序化检索候选 → Story Plan / Timeline IR。
 
-    生产版以 LLM 替换选镜逻辑，但必须输出同一 Story Plan / Timeline IR 契约。
+    降级：语义数据（visual/transcript）缺失或 ollama 不可用时回退确定性 Director，
+    输出同一 Story Plan / Timeline IR 契约（架构 §4.6/4.8）。
     """
     if target_duration <= 0:
         raise ValueError(f"目标时长必须为正数：{target_duration}")
     shots = (media_index or {}).get("shots", [])
     if not shots:
         raise ValueError("Media Index 中没有 Shot，请先执行 ingest")
+    config = config or load_config()
 
+    # 语义数据就绪且感知层可用时才走 LLM 路径，否则确定性回退
+    has_semantics = bool(media_index.get("visual") and media_index.get("transcript"))
+    if has_semantics and _ollama_available(config):
+        try:
+            directed = _direct_goal(goal, target_duration, config)
+            candidates = _retrieve_shots(media_index, directed["beats"], directed, config)
+            if candidates:
+                return _compose_plan(candidates, goal, target_duration, directed, media_index)
+            raise RuntimeError("检索未产生任何候选")
+        except Exception as exc:  # 感知层/解析/检索任一失败均可降级
+            print(f"aicut: 警告：LLM Director 失败（{exc}），回退确定性 Director")
+    return _plan_fallback(media_index, goal, target_duration)
+
+
+def _plan_fallback(media_index: dict, goal: str, target_duration: float) -> dict:
+    """确定性回退 Director：按有效时长降序选镜（架构 §4.6 PoC）。"""
+    shots = media_index.get("shots", [])
     selected = _select_clips(shots, target_duration)
     beats = _story_beats(target_duration)
 
@@ -679,22 +698,310 @@ def plan(media_index: dict | None = None, goal: str = "", target_duration: float
         "beats": beats,
         "candidates": candidates,
     }
-
     timeline_in = 0.0
     clips = []
     for c in selected:
-        clips.append({
-            "id": f"clip-{len(clips) + 1:04d}",
-            "shot_id": c["shot"]["id"],
-            "source_in": c["source_in"],
-            "source_out": c["source_out"],
-            "timeline_in": round(timeline_in, 3),
-            "timeline_out": round(timeline_in + c["use"], 3),
-            "track": "V1",
-            "transition_out": 0.0,
-        })
+        clips.append(_make_clip(c["shot"], c["source_in"], c["source_out"],
+                                timeline_in, len(clips) + 1))
         timeline_in += c["use"]
+    timeline = {
+        "schema_version": "1.0",
+        "goal": goal,
+        "target_duration": target_duration,
+        "duration": round(timeline_in, 3),
+        "clips": clips,
+    }
+    return {"story_plan": story_plan, "timeline": timeline}
 
+
+# ---------------------------------------------------------------------------
+# P3 LLM Director：Goal 拆解 + 叙事 Beat + 程序化检索（架构 §4.6 / P3）
+# ---------------------------------------------------------------------------
+
+DIRECTOR_PROMPT = (
+    "你是视频剪辑导演。根据用户目标与目标时长，把成片拆成叙事结构。"
+    "只输出 JSON（不要任何其他文字）：\n"
+    '{{"hard_constraints": ["必须包含/必须避免的边界条件（没有则空数组）"], '
+    '"soft_preferences": ["风格、节奏等软偏好"], '
+    '"beats": [{{"name": "节拍名", "intent": "内容意图", '
+    '"query": "检索关键词（中文，空格分隔，覆盖画面与语音主题）", '
+    '"target_ratio": 0.15}}]}}\n'
+    "要求：\n"
+    "- beats 3-5 个，按叙事顺序（开场/发展/高潮/收束）。\n"
+    "- target_ratio 为该节拍时长占比，全部相加约等于 1。\n"
+    "- 硬约束只写画面关键词无法表达的边界（如：不使用模糊镜头、必须包含 XX 环节）。\n"
+    "用户目标：{goal}\n目标时长：{target_seconds} 秒"
+)
+
+
+def _direct_goal(goal: str, target_duration: float, config: dict) -> dict:
+    """LLM Goal 解析：拆硬约束/软偏好，生成叙事 Beat（含检索 query 与时长占比）。
+
+    返回 {hard_constraints, soft_preferences, beats}；beats 的 target_seconds 由
+    程序按占比归一化计算（不信任模型数字）。失败抛 RuntimeError。
+    """
+    import requests
+
+    vision = config.get("vision", {})
+    host = vision.get("host", "http://127.0.0.1:11434")
+    model = vision.get("model", "qwen2.5vl:3b")
+    prompt = DIRECTOR_PROMPT.format(goal=goal, target_seconds=int(round(target_duration)))
+    payload: dict = {"model": model, "prompt": prompt, "stream": False}
+    num_gpu = vision.get("num_gpu")
+    if num_gpu is not None:
+        payload["options"] = {"num_gpu": num_gpu}
+    try:
+        resp = requests.post(f"{host}/api/generate", json=payload, timeout=600)
+        resp.raise_for_status()
+        text = resp.json().get("response", "")
+    except Exception as exc:
+        raise RuntimeError(f"ollama 调用失败：{exc}")
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"LLM Director 输出不是合法 JSON：{text[:200]}")
+
+    beats = data.get("beats")
+    if not isinstance(beats, list) or not beats:
+        raise RuntimeError("LLM Director 未输出 beats")
+    ratio_sum = 0.0
+    for b in beats:
+        try:
+            ratio_sum += max(0.0, float(b.get("target_ratio", 0)))
+        except (TypeError, ValueError):
+            b["target_ratio"] = 0.0
+    if ratio_sum <= 0:
+        ratio_sum = float(len(beats))
+        for b in beats:
+            b["target_ratio"] = 1.0
+    for b in beats:
+        b.setdefault("name", "节拍")
+        b.setdefault("intent", "")
+        b.setdefault("query", b.get("intent", ""))
+        b.setdefault("id", f"beat-{beats.index(b) + 1:02d}")
+        ratio = max(0.0, float(b.get("target_ratio", 0))) / ratio_sum
+        b["target_seconds"] = round(target_duration * ratio, 2)
+    return {
+        "hard_constraints": data.get("hard_constraints") or [],
+        "soft_preferences": data.get("soft_preferences") or [],
+        "beats": beats,
+    }
+
+
+def _shot_context(media_index: dict, shot: dict) -> tuple[str, str]:
+    """拼出 Shot 的检索文本与语音文本（视觉摘要/标签/地点/动作 + 区间内语音）。"""
+    visual = ((media_index.get("visual") or {}).get("shots") or {}).get(shot["id"], {})
+    parts = [
+        visual.get("summary", ""),
+        visual.get("location", ""),
+        " ".join(visual.get("tags", []) or []),
+        " ".join(visual.get("actions", []) or []),
+        " ".join(visual.get("people", []) or []),
+        visual.get("mood", ""),
+    ]
+    segments = ((media_index.get("transcript") or {}).get("sources") or {})
+    segs = (segments.get(shot["source_id"], {}) or {}).get("segments", []) or []
+    speech = " ".join(
+        s.get("text", "") for s in segs
+        if s.get("start", 0) < shot.get("end", 0) and s.get("end", 0) > shot.get("start", 0)
+    )
+    if speech:
+        parts.append(speech)
+    return " ".join(p for p in parts if p), speech
+
+
+def _match_score(query: str, text: str) -> float:
+    """中文轻量匹配分：整词命中 2 分/词，字符 bigram 命中 1 分/gram（无分词依赖）。"""
+    import re
+
+    def tokens(s: str) -> tuple[list[str], set[str]]:
+        words = [w for w in re.split(r"[\s,，。；;、！!？?：:·\-—()（）\"'《》<>/]+|\d+\.?\d*s?", s) if w]
+        grams = set()
+        for w in words:
+            if len(w) >= 2:
+                grams.update(w[i:i + 2] for i in range(len(w) - 1))
+        return words, grams
+
+    qwords, qgrams = tokens(query)
+    twords, tgrams = tokens(text)
+    tset = set(twords)
+    score = 2.0 * sum(1 for w in qwords if w in tset)
+    score += float(len(qgrams & tgrams))
+    return score
+
+
+def _hard_constraint_penalty(constraints: list, shot: dict, media_index: dict) -> float:
+    """硬约束近似：质量类约束命中 issues/低分时重罚；'必须包含 X' 未命中时重罚。"""
+    import re
+
+    visual = ((media_index.get("visual") or {}).get("shots") or {}).get(shot["id"], {})
+    quality = visual.get("quality") or {}
+    score = float(quality.get("score", 0.5))
+    issues = " ".join(quality.get("issues", []) or [])
+    ctx, _ = _shot_context(media_index, shot)
+    quality_kw = ("模糊", "虚焦", "过暗", "抖动", "失焦", "欠曝")
+    stop_kw = ("必须", "一定要", "需要", "包含", "含有", "包括", "不使用", "避免", "不能", "禁止")
+    penalty = 0.0
+    for c in constraints:
+        c = str(c)
+        if any(k in c for k in quality_kw):
+            # 质量类约束：只按 issues/质量分判断，不再做内容词检查
+            if any(k in issues for k in quality_kw) or score < 0.5:
+                penalty += 100.0
+            continue
+        words = []
+        for run in re.findall(r"[\u4e00-\u9fff]+", c):
+            for stop in stop_kw:
+                run = run.replace(stop, "")
+            # 2 字滑窗："婚礼环节" 命中含 "婚礼" 或 "环节" 的上下文
+            words.extend(run[i:i + 2] for i in range(len(run) - 1))
+        if words and not any(w in ctx for w in words):
+            penalty += 50.0
+    return penalty
+
+
+def _retrieve_shots(media_index: dict, beats: list[dict], directed: dict, config: dict) -> list[dict]:
+    """按 Beat 检索候选：语义匹配全局归属 + 质量/语音加分 − 硬约束罚分。
+
+    每个 Shot 先归属语义匹配分最高的 Beat（避免无关 Beat 抢镜），
+    Beat 内按（匹配分, 质量）排序取候选；无匹配的 Beat 才按质量兜底。
+    """
+    shots = media_index.get("shots", [])
+    by_id = {s["id"]: s for s in shots}
+    constraints = directed.get("hard_constraints") or []
+
+    # 预计算各 Shot 上下文/质量/罚分，及对每个 Beat 的语义匹配分
+    info: dict[str, dict] = {}
+    match: dict[tuple, float] = {}
+    for shot in shots:
+        ctx, speech = _shot_context(media_index, shot)
+        visual = ((media_index.get("visual") or {}).get("shots") or {}).get(shot["id"], {})
+        q = float(((visual.get("quality") or {}).get("score", 0.5)))
+        penalty = _hard_constraint_penalty(constraints, shot, media_index)
+        info[shot["id"]] = {"ctx": ctx, "speech": speech, "q": q, "penalty": penalty}
+        for beat in beats:
+            query = beat.get("query") or beat.get("intent") or beat.get("name", "")
+            match[(shot["id"], beat["id"])] = _match_score(query, ctx)
+
+    # 全局归属：每个 Shot 只进入匹配分最高的 Beat（m>0 才归属）
+    assigned: dict[str, list[tuple[str, float]]] = {}
+    for shot in shots:
+        best_beat, best_m = None, 0.0
+        for beat in beats:
+            m = match[(shot["id"], beat["id"])]
+            if m > best_m:
+                best_beat, best_m = beat["id"], m
+        if best_beat is not None:
+            assigned.setdefault(best_beat, []).append((shot["id"], best_m))
+
+
+    def _pick(shot: dict, m: float, reason_note: str, chosen: list, used_t: float,
+              budget: float, used: set, apply_penalty: bool = True) -> float:
+        info_ = info[shot["id"]]
+        penalty = info_["penalty"] if apply_penalty else 0.0
+        total = (m + info_["q"] * 0.5
+                 + min(len(info_["speech"]) / 50.0, 1.0) - penalty)
+        if total <= 0 or shot["id"] in used:
+            return used_t
+        use = min(shot["duration"], DEFAULT_CLIP_MAX_SECONDS)
+        if use <= 0:
+            return used_t
+        if shot["duration"] > use:
+            mid = shot["start"] + (shot["duration"] - use) / 2
+            source_in, source_out = mid, mid + use
+        else:
+            source_in, source_out = shot["start"], shot["end"]
+        chosen.append({
+            "shot": shot,
+            "source_in": round(source_in, 3),
+            "source_out": round(source_out, 3),
+            "use": round(use, 3),
+            "beat_id": "",
+            "reason": reason_note,
+            "score": round(total, 3),
+        })
+        used.add(shot["id"])
+        return used_t + use
+
+    candidates: list[dict] = []
+    used: set[str] = set()
+    for beat in beats:
+        budget = beat.get("target_seconds", 0.0)
+        query = beat.get("query") or beat.get("intent") or beat.get("name", "")
+        pool = sorted(assigned.get(beat["id"], []), key=lambda x: (-x[1], x[0]))
+        chosen: list[dict] = []
+        used_t = 0.0
+        for sid, m in pool:
+            if used_t >= budget and chosen:
+                break
+            shot = by_id[sid]
+            used_t = _pick(shot, m, f"匹配'{query}'命中 {m:.1f}", chosen, used_t, budget, used)
+        # 无语义匹配的 Beat：按质量兜底补足预算（不抢已归属其他 Beat 的镜头）
+        if not chosen or used_t < budget:
+            for shot in sorted(shots, key=lambda s: (-info[s["id"]]["q"], s["id"])):
+                if used_t >= budget and chosen:
+                    break
+                if shot["id"] in used:
+                    continue
+                info_ = info[shot["id"]]
+                if info_["penalty"] >= 100.0:
+                    continue
+                # 该镜头若匹配其他 Beat 则留给对应 Beat
+                if any(match[(shot["id"], b["id"])] > 0
+                       for b in beats if b["id"] != beat["id"]):
+                    continue
+                used_t = _pick(shot, 0.0, "语义匹配不足，按质量兜底", chosen, used_t, budget, used,
+                               apply_penalty=False)
+        for c in chosen:
+            c["beat_id"] = beat["id"]
+            # 备选：同 Beat 未入选的次优（语义匹配）候选
+            c["alternatives"] = [sid for sid, _ in pool if sid != c["shot"]["id"]][:3]
+        candidates.extend(chosen)
+    return candidates
+
+
+def _make_clip(shot: dict, source_in: float, source_out: float,
+               timeline_in: float, idx: int) -> dict:
+    """Timeline IR 单片段（架构 §4.8）。"""
+    return {
+        "id": f"clip-{idx:04d}",
+        "shot_id": shot["id"],
+        "source_in": source_in,
+        "source_out": source_out,
+        "timeline_in": round(timeline_in, 3),
+        "timeline_out": round(timeline_in + (source_out - source_in), 3),
+        "track": "V1",
+        "transition_out": 0.0,
+    }
+
+
+def _compose_plan(candidates: list[dict], goal: str, target_duration: float,
+                  directed: dict, media_index: dict) -> dict:
+    """由检索候选组装 Story Plan 与 Timeline IR（LLM Director 路径）。"""
+    story_plan = {
+        "schema_version": "1.0",
+        "goal": goal,
+        "target_duration": target_duration,
+        "hard_constraints": directed.get("hard_constraints") or [],
+        "soft_preferences": directed.get("soft_preferences") or [],
+        "beats": directed["beats"],
+        "candidates": [
+            {
+                "shot_id": c["shot"]["id"],
+                "source_id": c["shot"]["source_id"],
+                "duration": c["use"],
+                "beat_id": c["beat_id"],
+                "reason": c["reason"],
+                "alternatives": c.get("alternatives", []),
+            }
+            for c in candidates
+        ],
+    }
+    timeline_in = 0.0
+    clips = []
+    for c in candidates:
+        clips.append(_make_clip(c["shot"], c["source_in"], c["source_out"],
+                                timeline_in, len(clips) + 1))
+        timeline_in += c["use"]
     timeline = {
         "schema_version": "1.0",
         "goal": goal,
